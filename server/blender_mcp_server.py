@@ -9,7 +9,7 @@ import json
 import os
 import socket
 import threading
-from typing import Any, Optional
+from typing import Any, Literal, Optional
 
 from mcp.server.fastmcp import FastMCP, Image
 
@@ -34,10 +34,12 @@ class BlenderConnection:
             sock.connect((self.host, self.port))
             self.sock = sock
 
-    def send_command(self, command_type: str, params: dict) -> dict:
+    def send_command(self, command_type: str, params: dict, timeout: Optional[float] = None) -> dict:
         with self._lock:
             try:
                 self._ensure_connected()
+                if timeout is not None:
+                    self.sock.settimeout(timeout)
                 payload = json.dumps({"type": command_type, "params": params}) + "\n"
                 self.sock.sendall(payload.encode("utf-8"))
                 while b"\n" not in self.buf:
@@ -47,7 +49,9 @@ class BlenderConnection:
                     self.buf += chunk
                 line, self.buf = self.buf.split(b"\n", 1)
                 response = json.loads(line.decode("utf-8"))
-            except (ConnectionError, OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+                if not isinstance(response, dict):
+                    raise ValueError(f"Unexpected response shape from Blender: {response!r}")
+            except (ConnectionError, OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
                 if self.sock is not None:
                     self.sock.close()
                 self.sock = None
@@ -57,6 +61,9 @@ class BlenderConnection:
                     "Is the Blender MCP Bridge add-on running and its server started? "
                     f"({exc})"
                 ) from exc
+            finally:
+                if timeout is not None and self.sock is not None:
+                    self.sock.settimeout(120)
             if response.get("status") != "ok":
                 error = response.get("error", "Unknown error from Blender")
                 traceback_str = response.get("traceback")
@@ -83,18 +90,20 @@ def get_object_info(name: str) -> dict:
     return _conn.send_command("get_object_info", {"name": name})
 
 
+PrimitiveType = Literal["cube", "sphere", "ico_sphere", "cylinder", "cone", "plane", "torus", "monkey"]
+LightType = Literal["POINT", "SUN", "SPOT", "AREA"]
+MirrorAxis = Literal["X", "Y", "Z"]
+
+
 @mcp.tool()
 def add_primitive(
-    type: str,
+    type: PrimitiveType,
     name: Optional[str] = None,
     location: tuple[float, float, float] = (0, 0, 0),
     rotation: tuple[float, float, float] = (0, 0, 0),
     scale: tuple[float, float, float] = (1, 1, 1),
 ) -> dict:
-    """Add a primitive mesh to the scene.
-
-    type must be one of: cube, sphere, ico_sphere, cylinder, cone, plane, torus, monkey.
-    """
+    """Add a primitive mesh to the scene."""
     params: dict[str, Any] = {"type": type, "location": list(location), "rotation": list(rotation), "scale": list(scale)}
     if name:
         params["name"] = name
@@ -158,13 +167,13 @@ def assign_material(object_name: str, material_name: str) -> dict:
 
 @mcp.tool()
 def add_light(
-    type: str = "POINT",
+    type: LightType = "POINT",
     name: str = "Light",
     location: tuple[float, float, float] = (0, 0, 5),
     energy: float = 1000.0,
     color: Optional[tuple[float, float, float]] = None,
 ) -> dict:
-    """Add a light to the scene. type is one of POINT, SUN, SPOT, AREA."""
+    """Add a light to the scene."""
     params: dict[str, Any] = {"type": type, "name": name, "location": list(location), "energy": energy}
     if color is not None:
         params["color"] = list(color)
@@ -196,8 +205,11 @@ def render_scene(
     resolution_x: int = 1024,
     resolution_y: int = 1024,
     samples: int = 64,
+    timeout: float = 600,
 ) -> Image:
-    """Render the current scene to a PNG and return it as an image."""
+    """Render the current scene to a PNG and return it as an image. Increase
+    timeout (seconds) for high-sample-count or high-resolution renders that
+    take longer than the default socket timeout."""
     result = _conn.send_command(
         "render_scene",
         {
@@ -207,13 +219,15 @@ def render_scene(
             "samples": samples,
             "return_image": True,
         },
+        timeout=timeout,
     )
     return Image(data=base64.b64decode(result["image_base64"]), format="png")
 
 
 @mcp.tool()
 def get_viewport_screenshot() -> Image:
-    """Capture a screenshot of Blender's 3D viewport (fast, unlit, for quick feedback)."""
+    """Capture a screenshot of Blender's 3D viewport using its current
+    on-screen shading mode (solid/material/rendered - whatever is active)."""
     result = _conn.send_command("get_viewport_screenshot", {})
     return Image(data=base64.b64decode(result["image_base64"]), format="png")
 
@@ -241,11 +255,12 @@ def add_capsule(
 
 
 @mcp.tool()
-def mirror_object(name: str, axis: str = "X", new_name: Optional[str] = None) -> dict:
-    """Duplicate an object and mirror it across the given local axis (X/Y/Z),
-    flipping normals so it renders correctly. Location is also mirrored about
-    world origin on that axis. Useful for generating the other half of a
-    symmetric part (e.g. mirror 'Arm_L' to get 'Arm_R')."""
+def mirror_object(name: str, axis: MirrorAxis = "X", new_name: Optional[str] = None) -> dict:
+    """Duplicate an object and reflect its world-space transform (position and
+    rotation) across the plane through the world origin perpendicular to the
+    given axis (X/Y/Z), flipping normals so it renders correctly. Useful for
+    generating the other half of a symmetric part (e.g. mirror 'Arm_L' to get
+    'Arm_R')."""
     params: dict[str, Any] = {"name": name, "axis": axis}
     if new_name:
         params["new_name"] = new_name
@@ -273,8 +288,11 @@ def join_objects(names: list[str], target_name: Optional[str] = None) -> dict:
 
 @mcp.tool()
 def undo(steps: int = 1) -> dict:
-    """Undo the last N operations in Blender. Best-effort: stops early if
-    there is nothing left to undo."""
+    """Undo the last N Blender undo steps. Best-effort: stops early if there
+    is nothing left to undo. Most MCP commands push one undo step, but a
+    compound command (e.g. add_capsule with caps, join_objects) may push
+    several internal steps and need more than one `undo` call to fully
+    reverse."""
     return _conn.send_command("undo", {"steps": steps})
 
 

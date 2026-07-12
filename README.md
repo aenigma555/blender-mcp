@@ -60,14 +60,29 @@ sun light, and render it."
 | `assign_material` | Assign a material to an object |
 | `add_light` | Add point/sun/spot/area light |
 | `set_camera` | Create/position a camera |
-| `render_scene` | Render to PNG, returned as an image |
-| `get_viewport_screenshot` | Quick unlit viewport capture |
+| `render_scene` | Render to PNG, returned as an image (has its own `timeout` for long renders) |
+| `get_viewport_screenshot` | Quick viewport capture, matches current on-screen shading |
+| `add_capsule` | Add a cylinder (+ optional rounded caps) aligned between two world-space points — use for limbs/bones instead of hand-computing rotations |
+| `mirror_object` | Duplicate an object, reflecting its world transform across an axis-aligned plane through the origin |
+| `parent_object` | Parent one object to another, optionally preserving world transform |
+| `join_objects` | Join multiple mesh objects into one |
+| `undo` | Undo the last N Blender undo steps |
 | `execute_code` | Escape hatch: run arbitrary `bpy`/`bmesh` code |
 | `save_file` | Save the `.blend` file |
 
 `execute_code` is the escape hatch for anything not covered above —
 bmesh editing, modifiers, geometry nodes, UV unwrapping, etc. Set a
 variable named `result` in the code to return data from it.
+
+Mesh-creation and mesh-combining commands (`add_primitive`, `add_capsule`,
+`join_objects`) require Blender to be in Object Mode and will reject the
+call otherwise, rather than risk mutating whatever mesh is currently being
+edited.
+
+`undo` maps to Blender's native undo stack. Most commands push exactly one
+step, but a compound command (e.g. `add_capsule` with `caps=True`, or
+`join_objects`) may push several internal steps and need more than one
+`undo` call to fully reverse.
 
 ## Notes
 
@@ -76,3 +91,13 @@ variable named `result` in the code to return data from it.
   env var if you need more).
 - The bridge trusts whatever code is sent to `execute_code` — don't
   expose the TCP port beyond localhost.
+- **Don't hot-reload the addon module from inside a running session**
+  (e.g. via `execute_code` re-exec'ing its own source). It's tempting
+  after editing `addon/blender_mcp_addon.py`, but patching the module
+  while the very connection making the request is served by it can
+  corrupt the server's socket/thread state and require a full Blender
+  restart to recover. Instead, reload cleanly: disable and re-enable
+  "Blender MCP Bridge" under Preferences > Add-ons, or restart Blender,
+  then click **Start MCP Server** again. After editing
+  `server/blender_mcp_server.py`, restart the Claude Code session (or
+  reconnect the MCP server) to pick up new tool schemas.

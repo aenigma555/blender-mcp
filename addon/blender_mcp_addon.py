@@ -29,18 +29,36 @@ _command_queue = queue.Queue()
 _timer_registered = False
 _client_sockets_lock = threading.Lock()
 _client_sockets = set()
+_generation = 0
 
 
 # ---------------------------------------------------------------------------
 # Command handlers (always executed on Blender's main thread via the timer)
 # ---------------------------------------------------------------------------
 
+def _get_scene_object(name):
+    return bpy.context.scene.objects.get(name)
+
+
+def _require_object_mode():
+    if bpy.context.mode != 'OBJECT':
+        raise RuntimeError(
+            f"Blender is in '{bpy.context.mode}' mode; switch to Object Mode before running this command"
+        )
+
+
 def _obj_summary(obj):
+    if obj.rotation_mode == 'QUATERNION':
+        rotation_euler = list(obj.rotation_quaternion.to_euler())
+    else:
+        rotation_euler = list(obj.rotation_euler)
     return {
         "name": obj.name,
         "type": obj.type,
         "location": list(obj.location),
-        "rotation_euler": list(obj.rotation_euler),
+        "rotation_mode": obj.rotation_mode,
+        "rotation_euler": rotation_euler,
+        "rotation_quaternion": list(obj.rotation_quaternion) if obj.rotation_mode == 'QUATERNION' else None,
         "scale": list(obj.scale),
         "dimensions": list(obj.dimensions),
         "visible": obj.visible_get(),
@@ -61,7 +79,7 @@ def cmd_get_scene_info(params):
 
 def cmd_get_object_info(params):
     name = params["name"]
-    obj = bpy.data.objects.get(name)
+    obj = _get_scene_object(name)
     if obj is None:
         raise ValueError(f"No object named '{name}'")
     info = _obj_summary(obj)
@@ -90,6 +108,7 @@ _PRIMITIVES = {
 
 
 def cmd_add_primitive(params):
+    _require_object_mode()
     prim_type = params["type"]
     if prim_type not in _PRIMITIVES:
         raise ValueError(f"Unknown primitive type '{prim_type}'. Options: {list(_PRIMITIVES)}")
@@ -106,7 +125,7 @@ def cmd_add_primitive(params):
 
 def cmd_delete_object(params):
     name = params["name"]
-    obj = bpy.data.objects.get(name)
+    obj = _get_scene_object(name)
     if obj is None:
         raise ValueError(f"No object named '{name}'")
     bpy.data.objects.remove(obj, do_unlink=True)
@@ -115,7 +134,7 @@ def cmd_delete_object(params):
 
 def cmd_set_transform(params):
     name = params["name"]
-    obj = bpy.data.objects.get(name)
+    obj = _get_scene_object(name)
     if obj is None:
         raise ValueError(f"No object named '{name}'")
     if "location" in params:
@@ -134,25 +153,34 @@ def cmd_create_material(params):
         mat = bpy.data.materials.new(name=name)
     mat.use_nodes = True
     bsdf = mat.node_tree.nodes.get("Principled BSDF")
-    if bsdf is not None:
-        if "base_color" in params:
-            r, g, b, *a = params["base_color"] + [1.0]
-            bsdf.inputs["Base Color"].default_value = (r, g, b, a[0] if a else 1.0)
-        if "metallic" in params:
-            bsdf.inputs["Metallic"].default_value = params["metallic"]
-        if "roughness" in params:
-            bsdf.inputs["Roughness"].default_value = params["roughness"]
-        if "emission_color" in params:
-            bsdf.inputs["Emission Color"].default_value = (*params["emission_color"], 1.0)
-        if "emission_strength" in params:
-            bsdf.inputs["Emission Strength"].default_value = params["emission_strength"]
+    requested_props = {"base_color", "metallic", "roughness", "emission_color", "emission_strength"}
+    if bsdf is None:
+        if requested_props & params.keys():
+            raise ValueError(
+                f"Material '{name}' has no 'Principled BSDF' node (custom node setup?); "
+                "cannot set the requested properties"
+            )
+        return {"material": mat.name}
+    if "base_color" in params:
+        r, g, b, *a = params["base_color"] + [1.0]
+        bsdf.inputs["Base Color"].default_value = (r, g, b, a[0] if a else 1.0)
+    if "metallic" in params:
+        bsdf.inputs["Metallic"].default_value = params["metallic"]
+    if "roughness" in params:
+        bsdf.inputs["Roughness"].default_value = params["roughness"]
+    if "emission_color" in params:
+        bsdf.inputs["Emission Color"].default_value = (*params["emission_color"], 1.0)
+    if "emission_strength" in params:
+        bsdf.inputs["Emission Strength"].default_value = params["emission_strength"]
     return {"material": mat.name}
 
 
 def cmd_assign_material(params):
-    obj = bpy.data.objects.get(params["object_name"])
+    obj = _get_scene_object(params["object_name"])
     if obj is None:
         raise ValueError(f"No object named '{params['object_name']}'")
+    if obj.data is None or not hasattr(obj.data, "materials"):
+        raise ValueError(f"Object '{obj.name}' (type {obj.type}) does not support materials")
     mat = bpy.data.materials.get(params["material_name"])
     if mat is None:
         raise ValueError(f"No material named '{params['material_name']}'")
@@ -178,8 +206,10 @@ def cmd_add_light(params):
 
 def cmd_set_camera(params):
     name = params.get("name", "Camera")
-    cam = bpy.data.objects.get(name)
-    if cam is None or cam.type != "CAMERA":
+    cam = _get_scene_object(name)
+    if cam is not None and cam.type != "CAMERA":
+        raise ValueError(f"Object '{name}' exists but is type {cam.type}, not CAMERA")
+    if cam is None:
         cam_data = bpy.data.cameras.new(name)
         cam = bpy.data.objects.new(name, cam_data)
         bpy.context.collection.objects.link(cam)
@@ -188,6 +218,8 @@ def cmd_set_camera(params):
     if "rotation" in params:
         cam.rotation_euler = params["rotation"]
     if "lens" in params:
+        if params["lens"] <= 0:
+            raise ValueError("lens must be positive")
         cam.data.lens = params["lens"]
     if params.get("make_active", True):
         bpy.context.scene.camera = cam
@@ -196,17 +228,30 @@ def cmd_set_camera(params):
 
 def cmd_render_scene(params):
     scene = bpy.context.scene
-    scene.render.resolution_x = params.get("resolution_x", 1024)
-    scene.render.resolution_y = params.get("resolution_y", 1024)
-    if "samples" in scene.cycles.__dir__() or hasattr(scene, "cycles"):
-        try:
-            scene.cycles.samples = params.get("samples", 64)
-        except Exception:
-            pass
-    filepath = params.get("filepath", "/tmp/blender_mcp_render.png")
+    resolution_x = params.get("resolution_x", 1024)
+    resolution_y = params.get("resolution_y", 1024)
+    samples = params.get("samples", 64)
+    if resolution_x <= 0 or resolution_y <= 0:
+        raise ValueError("resolution_x and resolution_y must be positive")
+    if samples <= 0:
+        raise ValueError("samples must be positive")
+    scene.render.resolution_x = resolution_x
+    scene.render.resolution_y = resolution_y
+    scene.render.resolution_percentage = 100
+
+    engine = scene.render.engine
+    if engine == "CYCLES" and hasattr(scene, "cycles"):
+        scene.cycles.samples = samples
+    elif engine in ("BLENDER_EEVEE", "BLENDER_EEVEE_NEXT") and hasattr(scene, "eevee"):
+        scene.eevee.taa_render_samples = samples
+
+    filepath = bpy.path.abspath(params.get("filepath", "/tmp/blender_mcp_render.png"))
     scene.render.filepath = filepath
     scene.render.image_settings.file_format = "PNG"
-    bpy.ops.render.render(write_still=True)
+    scene.render.use_file_extension = False
+    render_result = bpy.ops.render.render(write_still=True)
+    if 'FINISHED' not in render_result:
+        raise RuntimeError(f"Render did not complete (result: {render_result!r})")
     result = {"filepath": filepath}
     if params.get("return_image", True):
         with open(filepath, "rb") as f:
@@ -220,7 +265,9 @@ def cmd_get_viewport_screenshot(params):
         for area in window.screen.areas:
             if area.type == "VIEW_3D":
                 with bpy.context.temp_override(window=window, area=area):
-                    bpy.ops.screen.screenshot_area(filepath=filepath)
+                    shot_result = bpy.ops.screen.screenshot_area(filepath=filepath)
+                if 'FINISHED' not in shot_result:
+                    raise RuntimeError(f"Screenshot did not complete (result: {shot_result!r})")
                 with open(filepath, "rb") as f:
                     data = base64.b64encode(f.read()).decode("ascii")
                 return {"filepath": filepath, "image_base64": data}
@@ -245,6 +292,7 @@ def _restore_selection(state):
 
 
 def cmd_add_capsule(params):
+    _require_object_mode()
     start = Vector(params["start"])
     end = Vector(params["end"])
     radius = params.get("radius", 0.1)
@@ -261,7 +309,9 @@ def cmd_add_capsule(params):
     center = (start + end) / 2
 
     prev = _save_selection()
-    bpy.ops.mesh.primitive_cylinder_add(radius=radius, depth=length, location=center)
+    cyl_result = bpy.ops.mesh.primitive_cylinder_add(radius=radius, depth=length, location=center)
+    if 'FINISHED' not in cyl_result:
+        raise RuntimeError(f"Failed to create cylinder (result: {cyl_result!r})")
     cyl = bpy.context.active_object
     cyl.name = name
     z = Vector((0, 0, 1))
@@ -300,7 +350,7 @@ def cmd_add_capsule(params):
 
 def cmd_mirror_object(params):
     name = params["name"]
-    obj = bpy.data.objects.get(name)
+    obj = _get_scene_object(name)
     if obj is None:
         raise ValueError(f"No object named '{name}'")
     if obj.type != "MESH":
@@ -316,14 +366,16 @@ def cmd_mirror_object(params):
     bpy.context.collection.objects.link(new_obj)
 
     try:
-        location = list(new_obj.location)
-        location[axis_index] = -location[axis_index]
-        new_obj.location = location
+        # Reflect the object's full world-space transform (position and
+        # rotation) across the world-origin plane perpendicular to axis, so
+        # this is correct even for rotated or parented objects.
+        reflect = Matrix.Identity(4)
+        reflect[axis_index][axis_index] = -1.0
+        new_obj.matrix_world = reflect @ obj.matrix_world
 
-        scale_vec = [1.0, 1.0, 1.0]
-        scale_vec[axis_index] = -1.0
-        new_obj.data.transform(Matrix.Diagonal((*scale_vec, 1.0)))
-
+        # The reflection has negative determinant, which flips face winding
+        # in world space; flip it back in local mesh data so it renders
+        # right-side-out.
         bm = bmesh.new()
         try:
             bm.from_mesh(new_obj.data)
@@ -345,25 +397,35 @@ def cmd_mirror_object(params):
 
 
 def cmd_parent_object(params):
-    child = bpy.data.objects.get(params["child"])
+    child = _get_scene_object(params["child"])
     if child is None:
         raise ValueError(f"No object named '{params['child']}'")
-    parent = bpy.data.objects.get(params["parent"])
+    parent = _get_scene_object(params["parent"])
     if parent is None:
         raise ValueError(f"No object named '{params['parent']}'")
-    child.parent = parent
     if params.get("keep_transform", True):
-        child.matrix_parent_inverse = parent.matrix_world.inverted()
+        # Capture the true world matrix first (matrix_basis alone is only
+        # meaningful relative to whatever parent the child had before, if
+        # any), then re-derive matrix_basis against the new parent with a
+        # clean identity parent-inverse.
+        world_matrix = child.matrix_world.copy()
+        child.parent = parent
+        child.matrix_parent_inverse = Matrix.Identity(4)
+        child.matrix_world = world_matrix
     else:
-        child.matrix_parent_inverse.identity()
+        child.parent = parent
+        child.matrix_parent_inverse = Matrix.Identity(4)
     return {"child": child.name, "parent": parent.name}
 
 
 def cmd_join_objects(params):
+    _require_object_mode()
     names = params["names"]
+    if len(set(names)) != len(names):
+        raise ValueError("names must not contain duplicates")
     objs = []
     for n in names:
-        obj = bpy.data.objects.get(n)
+        obj = _get_scene_object(n)
         if obj is None:
             raise ValueError(f"No object named '{n}'")
         if obj.type != "MESH":
@@ -371,11 +433,15 @@ def cmd_join_objects(params):
         objs.append(obj)
     if len(objs) < 2:
         raise ValueError("Need at least 2 objects to join")
+    prev = _save_selection()
     bpy.ops.object.select_all(action='DESELECT')
     for o in objs:
         o.select_set(True)
     bpy.context.view_layer.objects.active = objs[0]
-    bpy.ops.object.join()
+    join_result = bpy.ops.object.join()
+    if 'FINISHED' not in join_result:
+        _restore_selection(prev)
+        raise RuntimeError(f"Join did not complete (result: {join_result!r})")
     joined = bpy.context.active_object
     target_name = params.get("target_name")
     if target_name:
@@ -411,6 +477,13 @@ def cmd_save_file(params):
     filepath = params["filepath"]
     bpy.ops.wm.save_as_mainfile(filepath=filepath)
     return {"saved": filepath}
+
+
+_MUTATING_COMMANDS = {
+    "add_primitive", "delete_object", "set_transform", "create_material",
+    "assign_material", "add_light", "set_camera", "add_capsule",
+    "mirror_object", "parent_object", "join_objects", "execute_code",
+}
 
 
 _HANDLERS = {
@@ -453,6 +526,18 @@ def _process_queue():
             if handler is None:
                 raise ValueError(f"Unknown command type '{command.get('type')}'")
             data = handler(command.get("params", {}))
+            if command.get("type") in _MUTATING_COMMANDS:
+                # Many of our commands mutate bpy.data directly rather than
+                # through operators, which otherwise leaves no undo step at
+                # all for `undo` to land on. Push one explicit boundary per
+                # command so it's always addressable, even though commands
+                # that internally run several operators (e.g. add_capsule
+                # with caps, join_objects) may still need more than one
+                # `undo` call to fully unwind.
+                try:
+                    bpy.ops.ed.undo_push(message=f"MCP: {command.get('type')}")
+                except RuntimeError:
+                    pass
             response_box.put({"status": "ok", "result": data})
         except Exception as exc:
             response_box.put({
@@ -471,12 +556,12 @@ def _send_response(conn, response):
     conn.sendall((payload + "\n").encode("utf-8"))
 
 
-def _handle_client(conn):
+def _handle_client(conn, generation):
     with _client_sockets_lock:
         _client_sockets.add(conn)
     buf = b""
     try:
-        while _running:
+        while _running and generation == _generation:
             try:
                 chunk = conn.recv(65536)
             except OSError:
@@ -505,7 +590,7 @@ def _handle_client(conn):
                 response_box = queue.Queue()
                 _command_queue.put((command, response_box))
                 response = None
-                while _running:
+                while _running and generation == _generation:
                     try:
                         response = response_box.get(timeout=0.5)
                         break
@@ -525,17 +610,17 @@ def _handle_client(conn):
         conn.close()
 
 
-def _accept_loop(sock):
-    while _running:
+def _accept_loop(sock, generation):
+    while _running and generation == _generation:
         try:
             conn, _addr = sock.accept()
         except OSError:
             break
-        threading.Thread(target=_handle_client, args=(conn,), daemon=True).start()
+        threading.Thread(target=_handle_client, args=(conn, generation), daemon=True).start()
 
 
 def start_server(port):
-    global _server_socket, _server_thread, _running, _timer_registered
+    global _server_socket, _server_thread, _running, _timer_registered, _generation
     if _running:
         return
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -548,7 +633,9 @@ def start_server(port):
     sock.listen(5)
     _server_socket = sock
     _running = True
-    _server_thread = threading.Thread(target=_accept_loop, args=(sock,), daemon=True)
+    _generation += 1
+    generation = _generation
+    _server_thread = threading.Thread(target=_accept_loop, args=(sock, generation), daemon=True)
     _server_thread.start()
     if not _timer_registered:
         bpy.app.timers.register(_process_queue, persistent=True)
@@ -556,8 +643,9 @@ def start_server(port):
 
 
 def stop_server():
-    global _server_socket, _running, _timer_registered
+    global _server_socket, _running, _timer_registered, _generation
     _running = False
+    _generation += 1  # invalidate any in-flight threads from the old generation
     if _server_socket is not None:
         try:
             _server_socket.close()
@@ -572,6 +660,14 @@ def stop_server():
             sock.close()
         except OSError:
             pass
+    # Drain any commands still queued so a fast restart can't execute them
+    # against a server generation that never actually enqueued them.
+    while True:
+        try:
+            _, response_box = _command_queue.get_nowait()
+        except queue.Empty:
+            break
+        response_box.put({"status": "error", "error": "Server was stopped before this command executed"})
     if _timer_registered:
         if bpy.app.timers.is_registered(_process_queue):
             bpy.app.timers.unregister(_process_queue)
