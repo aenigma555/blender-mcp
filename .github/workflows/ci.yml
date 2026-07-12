@@ -1,0 +1,48 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  server-tests:
+    name: Server protocol tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v3
+      - name: Install dependencies
+        run: cd server && uv sync
+      - name: Run tests
+        run: cd server && uv run python -m unittest discover -s tests -v
+
+  addon-tests:
+    name: Blender ${{ matrix.blender_version }} regression tests
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Verified working version — the suite is actively developed/run against this one.
+          - blender_version: 5.1.2
+            blender_series: "5.1"
+          # Latest patch of the LTS series matching bl_info's declared minimum (4, 0, 0).
+          - blender_version: 4.2.22
+            blender_series: "4.2"
+    steps:
+      - uses: actions/checkout@v4
+      - name: Cache Blender ${{ matrix.blender_version }}
+        id: cache-blender
+        uses: actions/cache@v4
+        with:
+          path: blender-${{ matrix.blender_version }}
+          key: blender-${{ matrix.blender_version }}-linux64
+      - name: Download Blender ${{ matrix.blender_version }}
+        if: steps.cache-blender.outputs.cache-hit != 'true'
+        run: |
+          curl -L "https://download.blender.org/release/Blender${{ matrix.blender_series }}/blender-${{ matrix.blender_version }}-linux-x64.tar.xz" | tar -xJ
+          mv "blender-${{ matrix.blender_version }}-linux-x64" "blender-${{ matrix.blender_version }}"
+      - name: Run headless regression suite
+        run: ./blender-${{ matrix.blender_version }}/blender --background --factory-startup --python-exit-code 1 --python addon/tests/headless_regression.py
