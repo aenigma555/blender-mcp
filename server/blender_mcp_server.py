@@ -5,16 +5,33 @@ started from inside Blender's sidebar panel) and exposes its commands
 as MCP tools.
 """
 import base64
+import binascii
 import json
+import math
 import os
 import socket
+import tempfile
 import threading
+import time
+import uuid
 from typing import Any, Literal, Optional
 
 from mcp.server.fastmcp import FastMCP, Image
 
 BLENDER_HOST = os.environ.get("BLENDER_MCP_HOST", "127.0.0.1")
 BLENDER_PORT = int(os.environ.get("BLENDER_MCP_PORT", "9876"))
+DEFAULT_TIMEOUT = 120.0
+DEFAULT_RENDER_PATH = os.path.join(tempfile.gettempdir(), "blender_mcp_render.png")
+MAX_RESPONSE_BYTES = 64 * 1024 * 1024
+MAX_SCENE_INFO_LIMIT = 10_000
+MAX_RENDER_DIMENSION = 4096
+MAX_RENDER_PIXELS = MAX_RENDER_DIMENSION * MAX_RENDER_DIMENSION
+MAX_RENDER_SAMPLES = 4096
+MAX_TIMEOUT = 3600.0
+MAX_JOIN_OBJECTS = 256
+MAX_UNDO_STEPS = 100
+MAX_EXECUTE_CODE_BYTES = 8 * 1024 * 1024
+RETRY_SAFE_COMMANDS = frozenset({"get_scene_info", "get_object_info"})
 
 mcp = FastMCP("blender")
 
@@ -27,43 +44,135 @@ class BlenderConnection:
         self.buf = b""
         self._lock = threading.Lock()
 
-    def _ensure_connected(self):
-        if self.sock is None:
-            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            sock.settimeout(120)
+    def _connect(self, timeout: float = DEFAULT_TIMEOUT):
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            sock.settimeout(timeout)
             sock.connect((self.host, self.port))
-            self.sock = sock
+        except OSError:
+            try:
+                sock.close()
+            except OSError:
+                pass
+            raise
+        self.sock = sock
+        self.buf = b""
+
+    def _close(self):
+        if self.sock is not None:
+            try:
+                self.sock.close()
+            except OSError:
+                pass
+        self.sock = None
+        self.buf = b""
 
     def send_command(self, command_type: str, params: dict, timeout: Optional[float] = None) -> dict:
-        with self._lock:
+        effective_timeout = DEFAULT_TIMEOUT if timeout is None else timeout
+        if (
+            isinstance(effective_timeout, bool)
+            or not isinstance(effective_timeout, (int, float))
+            or not math.isfinite(effective_timeout)
+            or effective_timeout <= 0
+            or effective_timeout > MAX_TIMEOUT
+        ):
+            raise ValueError(f"timeout must be greater than 0 and at most {MAX_TIMEOUT:g} seconds")
+        deadline = time.monotonic() + effective_timeout
+        if not self._lock.acquire(timeout=effective_timeout):
+            raise ConnectionError(
+                f"Timed out after {effective_timeout:g}s waiting for another Blender command; "
+                "no command was sent."
+            )
+        try:
+            request_id = uuid.uuid4().hex
+            payload = (
+                json.dumps({"id": request_id, "type": command_type, "params": params}) + "\n"
+            ).encode("utf-8")
+            line = b""
+            send_was_attempted = False
+
+            def remaining_timeout() -> float:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise socket.timeout("command deadline expired")
+                return remaining
+
+            for attempt in (0, 1):
+                try:
+                    if self.sock is None:
+                        self._connect(remaining_timeout())
+                    self.sock.settimeout(remaining_timeout())
+                    send_was_attempted = True
+                    self.sock.sendall(payload)
+                    while b"\n" not in self.buf:
+                        self.sock.settimeout(remaining_timeout())
+                        chunk = self.sock.recv(65536)
+                        if not chunk:
+                            raise ConnectionError("Blender closed the connection")
+                        self.buf += chunk
+                        newline_index = self.buf.find(b"\n")
+                        if (
+                            newline_index > MAX_RESPONSE_BYTES
+                            or (newline_index < 0 and len(self.buf) > MAX_RESPONSE_BYTES)
+                        ):
+                            raise ConnectionError(
+                                f"Blender response exceeds the {MAX_RESPONSE_BYTES}-byte limit"
+                            )
+                    line, self.buf = self.buf.split(b"\n", 1)
+                    break
+                except socket.timeout as exc:
+                    self._close()
+                    if not send_was_attempted:
+                        raise ConnectionError(
+                            f"Timed out after {effective_timeout:g}s connecting to Blender at "
+                            f"{self.host}:{self.port}; no command was sent."
+                        ) from exc
+                    raise ConnectionError(
+                        f"Timed out after {effective_timeout:g}s waiting for Blender to finish "
+                        f"'{command_type}' (request {request_id}). The outcome is unknown: the "
+                        "timeout does not cancel Blender work, so it may still complete. Inspect "
+                        "the scene before retrying the mutation."
+                    ) from exc
+                except (ConnectionError, OSError) as exc:
+                    self._close()
+                    # Inspection calls are intrinsically safe to retry. A
+                    # command that never reached sendall is safe too. Mutating
+                    # commands are not automatically replayed after sending:
+                    # the add-on's response cache is deliberately bounded, so
+                    # an unconditional replay could eventually outlive it.
+                    if attempt == 0 and (
+                        not send_was_attempted or command_type in RETRY_SAFE_COMMANDS
+                    ):
+                        continue
+                    outcome = (
+                        " The command outcome is unknown because sending began; Blender may "
+                        "still complete it."
+                        if send_was_attempted
+                        else ""
+                    )
+                    raise ConnectionError(
+                        f"Could not reach Blender at {self.host}:{self.port}. "
+                        "Is the Blender MCP Bridge add-on running and its server started? "
+                        f"Request: {request_id}. ({exc}){outcome}"
+                    ) from exc
             try:
-                self._ensure_connected()
-                if timeout is not None:
-                    self.sock.settimeout(timeout)
-                payload = json.dumps({"type": command_type, "params": params}) + "\n"
-                self.sock.sendall(payload.encode("utf-8"))
-                while b"\n" not in self.buf:
-                    chunk = self.sock.recv(65536)
-                    if not chunk:
-                        raise ConnectionError("Blender closed the connection")
-                    self.buf += chunk
-                line, self.buf = self.buf.split(b"\n", 1)
                 response = json.loads(line.decode("utf-8"))
-                if not isinstance(response, dict):
-                    raise ValueError(f"Unexpected response shape from Blender: {response!r}")
-            except (ConnectionError, OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
-                if self.sock is not None:
-                    self.sock.close()
-                self.sock = None
-                self.buf = b""
+            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                self._close()
+                raise ConnectionError(f"Malformed response from Blender: {exc}") from exc
+            if not isinstance(response, dict):
+                self._close()
+                raise ConnectionError(f"Unexpected response shape from Blender: {response!r}")
+            if response.get("id") != request_id:
+                if response.get("id") is None and response.get("status") == "error":
+                    self._close()
+                    raise RuntimeError(response.get("error", "Blender rejected the connection"))
+                self._close()
                 raise ConnectionError(
-                    f"Could not reach Blender at {self.host}:{self.port}. "
-                    "Is the Blender MCP Bridge add-on running and its server started? "
-                    f"({exc})"
-                ) from exc
-            finally:
-                if timeout is not None and self.sock is not None:
-                    self.sock.settimeout(120)
+                    "Response request ID mismatch; update/restart both Blender MCP components "
+                    f"(expected {request_id!r}, got {response.get('id')!r})"
+                )
             if response.get("status") != "ok":
                 error = response.get("error", "Unknown error from Blender")
                 traceback_str = response.get("traceback")
@@ -71,16 +180,52 @@ class BlenderConnection:
                     error = f"{error}\n\n{traceback_str}"
                 raise RuntimeError(error)
             return response.get("result", {})
+        finally:
+            self._lock.release()
 
 
 _conn = BlenderConnection(BLENDER_HOST, BLENDER_PORT)
 
 
+def _bounded_int(value: int, name: str, *, minimum: int, maximum: int) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise TypeError(f"{name} must be an integer")
+    if not minimum <= value <= maximum:
+        raise ValueError(f"{name} must be between {minimum} and {maximum}")
+    return value
+
+
+def _finite_number(
+    value: float, name: str, *, minimum: Optional[float] = None, maximum: Optional[float] = None
+) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+        raise TypeError(f"{name} must be a finite number")
+    value = float(value)
+    if minimum is not None and value < minimum:
+        raise ValueError(f"{name} must be at least {minimum}")
+    if maximum is not None and value > maximum:
+        raise ValueError(f"{name} must be at most {maximum}")
+    return value
+
+
+def _decode_png_result(result: dict) -> Image:
+    try:
+        encoded = result["image_base64"]
+        if not isinstance(encoded, str):
+            raise TypeError("image_base64 is not a string")
+        data = base64.b64decode(encoded, validate=True)
+    except (KeyError, TypeError, ValueError, binascii.Error) as exc:
+        raise ConnectionError(f"Blender returned malformed PNG image data: {exc}") from exc
+    return Image(data=data, format="png")
+
+
 @mcp.tool()
-def get_scene_info() -> dict:
+def get_scene_info(limit: int = 200) -> dict:
     """Get a summary of every object in the current Blender scene, including
-    transforms, dimensions, and which object is active."""
-    return _conn.send_command("get_scene_info", {})
+    transforms, dimensions, and which object is active. At most `limit`
+    objects are returned; `object_count`/`truncated` report the full size."""
+    limit = _bounded_int(limit, "limit", minimum=1, maximum=MAX_SCENE_INFO_LIMIT)
+    return _conn.send_command("get_scene_info", {"limit": limit})
 
 
 @mcp.tool()
@@ -123,8 +268,10 @@ def set_transform(
     rotation: Optional[tuple[float, float, float]] = None,
     scale: Optional[tuple[float, float, float]] = None,
 ) -> dict:
-    """Set location/rotation(euler radians)/scale on an existing object.
-    Any argument left as None is unchanged."""
+    """Set location/rotation(XYZ euler radians)/scale on an existing object;
+    values are local-space if the object is parented. Rotation is applied
+    correctly whatever the object's rotation mode is. Any argument left as
+    None is unchanged."""
     params: dict[str, Any] = {"name": name}
     if location is not None:
         params["location"] = list(location)
@@ -143,19 +290,39 @@ def create_material(
     roughness: Optional[float] = None,
     emission_color: Optional[tuple[float, float, float]] = None,
     emission_strength: Optional[float] = None,
+    alpha: Optional[float] = None,
+    ior: Optional[float] = None,
+    transmission: Optional[float] = None,
+    specular: Optional[float] = None,
+    coat: Optional[float] = None,
+    sheen: Optional[float] = None,
+    subsurface: Optional[float] = None,
 ) -> dict:
-    """Create (or update) a Principled-BSDF material. Colors are RGB 0-1."""
+    """Create (or update) a Principled-BSDF material. Colors are RGB 0-1.
+    Scalar weights (0-1): transmission makes glass (pair with low roughness
+    and ior ~1.45), alpha < 1 makes it transparent (the material is switched
+    to blended mode automatically), specular sets Specular IOR Level, and
+    coat/sheen/subsurface set the matching BSDF weights."""
     params: dict[str, Any] = {"name": name}
+    scalars = {
+        "metallic": metallic,
+        "roughness": roughness,
+        "emission_strength": emission_strength,
+        "alpha": alpha,
+        "ior": ior,
+        "transmission": transmission,
+        "specular": specular,
+        "coat": coat,
+        "sheen": sheen,
+        "subsurface": subsurface,
+    }
+    for key, value in scalars.items():
+        if value is not None:
+            params[key] = value
     if base_color is not None:
         params["base_color"] = list(base_color)
-    if metallic is not None:
-        params["metallic"] = metallic
-    if roughness is not None:
-        params["roughness"] = roughness
     if emission_color is not None:
         params["emission_color"] = list(emission_color)
-    if emission_strength is not None:
-        params["emission_strength"] = emission_strength
     return _conn.send_command("create_material", params)
 
 
@@ -170,13 +337,21 @@ def add_light(
     type: LightType = "POINT",
     name: str = "Light",
     location: tuple[float, float, float] = (0, 0, 5),
-    energy: float = 1000.0,
+    energy: Optional[float] = None,
     color: Optional[tuple[float, float, float]] = None,
+    rotation: Optional[tuple[float, float, float]] = None,
 ) -> dict:
-    """Add a light to the scene."""
-    params: dict[str, Any] = {"type": type, "name": name, "location": list(location), "energy": energy}
+    """Add a light to the scene. energy defaults to 1000 W for point/spot/area
+    lights and 3 for SUN lights (sun strength is irradiance in W/m^2, so
+    hundreds would blow out the scene). rotation (XYZ euler radians) aims
+    directional lights - they point straight down -Z at zero rotation."""
+    params: dict[str, Any] = {"type": type, "name": name, "location": list(location)}
+    if energy is not None:
+        params["energy"] = energy
     if color is not None:
         params["color"] = list(color)
+    if rotation is not None:
+        params["rotation"] = list(rotation)
     return _conn.send_command("add_light", params)
 
 
@@ -185,15 +360,21 @@ def set_camera(
     name: str = "Camera",
     location: Optional[tuple[float, float, float]] = None,
     rotation: Optional[tuple[float, float, float]] = None,
+    look_at: Optional[tuple[float, float, float]] = None,
     lens: Optional[float] = None,
     make_active: bool = True,
 ) -> dict:
-    """Create or update a camera and optionally make it the active scene camera."""
+    """Create or update a camera and optionally make it the active scene
+    camera. look_at aims the camera at a world-space point (applied after
+    location, mutually exclusive with rotation) - prefer it over computing
+    euler angles by hand."""
     params: dict[str, Any] = {"name": name, "make_active": make_active}
     if location is not None:
         params["location"] = list(location)
     if rotation is not None:
         params["rotation"] = list(rotation)
+    if look_at is not None:
+        params["look_at"] = list(look_at)
     if lens is not None:
         params["lens"] = lens
     return _conn.send_command("set_camera", params)
@@ -201,15 +382,26 @@ def set_camera(
 
 @mcp.tool()
 def render_scene(
-    filepath: str = "/tmp/blender_mcp_render.png",
+    filepath: str = DEFAULT_RENDER_PATH,
     resolution_x: int = 1024,
     resolution_y: int = 1024,
     samples: int = 64,
     timeout: float = 600,
 ) -> Image:
-    """Render the current scene to a PNG and return it as an image. Increase
-    timeout (seconds) for high-sample-count or high-resolution renders that
-    take longer than the default socket timeout."""
+    """Render the current scene to a PNG and return it as an image. The
+    scene's own render settings are restored afterwards. Increase timeout
+    (seconds) for high-sample-count or high-resolution renders that take
+    longer than the default."""
+    resolution_x = _bounded_int(
+        resolution_x, "resolution_x", minimum=1, maximum=MAX_RENDER_DIMENSION
+    )
+    resolution_y = _bounded_int(
+        resolution_y, "resolution_y", minimum=1, maximum=MAX_RENDER_DIMENSION
+    )
+    if resolution_x * resolution_y > MAX_RENDER_PIXELS:
+        raise ValueError(f"render size must not exceed {MAX_RENDER_PIXELS} total pixels")
+    samples = _bounded_int(samples, "samples", minimum=1, maximum=MAX_RENDER_SAMPLES)
+    timeout = _finite_number(timeout, "timeout", minimum=1.0e-6, maximum=MAX_TIMEOUT)
     result = _conn.send_command(
         "render_scene",
         {
@@ -221,7 +413,7 @@ def render_scene(
         },
         timeout=timeout,
     )
-    return Image(data=base64.b64decode(result["image_base64"]), format="png")
+    return _decode_png_result(result)
 
 
 @mcp.tool()
@@ -229,7 +421,7 @@ def get_viewport_screenshot() -> Image:
     """Capture a screenshot of Blender's 3D viewport using its current
     on-screen shading mode (solid/material/rendered - whatever is active)."""
     result = _conn.send_command("get_viewport_screenshot", {})
-    return Image(data=base64.b64decode(result["image_base64"]), format="png")
+    return _decode_png_result(result)
 
 
 @mcp.tool()
@@ -243,6 +435,9 @@ def add_capsule(
     """Add a cylinder (optionally with rounded sphere caps) aligned between two
     world-space points. Use this for limbs/bones instead of hand-rotating a
     cylinder with Euler angles - it handles the alignment math for you."""
+    radius = _finite_number(radius, "radius", minimum=1.0e-9, maximum=1_000_000.0)
+    if not isinstance(caps, bool):
+        raise TypeError("caps must be a boolean")
     params: dict[str, Any] = {
         "start": list(start),
         "end": list(end),
@@ -256,11 +451,12 @@ def add_capsule(
 
 @mcp.tool()
 def mirror_object(name: str, axis: MirrorAxis = "X", new_name: Optional[str] = None) -> dict:
-    """Duplicate an object and reflect its world-space transform (position and
-    rotation) across the plane through the world origin perpendicular to the
-    given axis (X/Y/Z), flipping normals so it renders correctly. Useful for
-    generating the other half of a symmetric part (e.g. mirror 'Arm_L' to get
-    'Arm_R')."""
+    """Duplicate an object and reflect its world-space transform across the
+    plane through the world origin perpendicular to the given axis (X/Y/Z),
+    exactly like Blender's Object > Mirror. Useful for generating the other
+    half of a symmetric part (e.g. mirror 'Arm_L' to get 'Arm_R'). The copy
+    renders correctly as-is; join_objects fixes face winding automatically
+    if you later join it into another mesh."""
     params: dict[str, Any] = {"name": name, "axis": axis}
     if new_name:
         params["new_name"] = new_name
@@ -279,7 +475,13 @@ def parent_object(child: str, parent: str, keep_transform: bool = True) -> dict:
 @mcp.tool()
 def join_objects(names: list[str], target_name: Optional[str] = None) -> dict:
     """Join multiple mesh objects into one. The first name in the list becomes
-    the base object unless target_name is given to rename the result."""
+    the base object unless target_name is given to rename the result. Sources
+    with mirrored (negative-determinant) transforms get their face winding
+    corrected during the join so normals stay outward."""
+    if not isinstance(names, list):
+        raise TypeError("names must be a list")
+    if not 2 <= len(names) <= MAX_JOIN_OBJECTS:
+        raise ValueError(f"names must contain between 2 and {MAX_JOIN_OBJECTS} objects")
     params: dict[str, Any] = {"names": names}
     if target_name:
         params["target_name"] = target_name
@@ -287,27 +489,59 @@ def join_objects(names: list[str], target_name: Optional[str] = None) -> dict:
 
 
 @mcp.tool()
+def set_shading(name: str, smooth: bool = True) -> dict:
+    """Set smooth (True) or flat (False) shading on every face of a mesh
+    object - e.g. smooth-shade spheres and capsules used as limbs."""
+    return _conn.send_command("set_shading", {"name": name, "smooth": smooth})
+
+
+@mcp.tool()
 def undo(steps: int = 1) -> dict:
     """Undo the last N Blender undo steps. Best-effort: stops early if there
     is nothing left to undo. Most MCP commands push one undo step, but a
-    compound command (e.g. add_capsule with caps, join_objects) may push
-    several internal steps and need more than one `undo` call to fully
-    reverse."""
+    compound operator-backed command such as join_objects may push several
+    internal steps and need more than one `undo` call to fully reverse."""
+    steps = _bounded_int(steps, "steps", minimum=1, maximum=MAX_UNDO_STEPS)
     return _conn.send_command("undo", {"steps": steps})
 
 
 @mcp.tool()
-def execute_code(code: str) -> dict:
-    """Escape hatch: run arbitrary Python inside Blender with `bpy` available.
-    Assign to a variable named `result` to return data. Use for anything not
-    covered by the other tools (bmesh editing, modifiers, geometry nodes, etc.)."""
-    return _conn.send_command("execute_code", {"code": code})
+def redo(steps: int = 1) -> dict:
+    """Redo the last N undone steps. Best-effort: stops early when there is
+    nothing left to redo."""
+    steps = _bounded_int(steps, "steps", minimum=1, maximum=MAX_UNDO_STEPS)
+    return _conn.send_command("redo", {"steps": steps})
 
 
 @mcp.tool()
-def save_file(filepath: str) -> dict:
-    """Save the current Blender scene to a .blend file at filepath."""
-    return _conn.send_command("save_file", {"filepath": filepath})
+def execute_code(code: str, timeout: float = DEFAULT_TIMEOUT) -> dict:
+    """Escape hatch: run arbitrary Python inside Blender. `bpy`, `bmesh`,
+    `mathutils`, `Vector`, `Matrix`, `Euler` and `Quaternion` are predefined.
+    Assign to a variable named `result` to return data (non-JSON-serializable
+    results come back as their repr). Use for anything not covered by the
+    other tools (modifiers, geometry nodes, UV work, etc.); raise timeout
+    (seconds) for long-running scripts like physics bakes."""
+    if not isinstance(code, str):
+        raise TypeError("code must be a string")
+    if len(code.encode("utf-8")) > MAX_EXECUTE_CODE_BYTES:
+        raise ValueError(f"code must be at most {MAX_EXECUTE_CODE_BYTES} UTF-8 bytes")
+    timeout = _finite_number(timeout, "timeout", minimum=1.0e-6, maximum=MAX_TIMEOUT)
+    return _conn.send_command("execute_code", {"code": code}, timeout=timeout)
+
+
+@mcp.tool()
+def save_file(filepath: Optional[str] = None) -> dict:
+    """Save the Blender scene. With filepath, does save-as to that .blend
+    path; without it, saves in place (errors if the file has never been
+    saved)."""
+    params: dict[str, Any] = {}
+    if filepath is not None:
+        if not isinstance(filepath, str):
+            raise TypeError("filepath must be a string")
+        if not filepath.strip():
+            raise ValueError("filepath must not be empty")
+        params["filepath"] = filepath
+    return _conn.send_command("save_file", params)
 
 
 if __name__ == "__main__":
