@@ -212,6 +212,10 @@ def cmd_get_object_info(params):
         [m.name if m else None for m in obj.data.materials]
         if obj.data is not None and hasattr(obj.data, "materials") else []
     )
+    info["data_name"] = obj.data.name if obj.data is not None else None
+    info["children"] = [child.name for child in obj.children]
+    info["constraints"] = [{"name": c.name, "type": c.type} for c in obj.constraints]
+    info["collections"] = [c.name for c in obj.users_collection]
     return info
 
 
@@ -518,6 +522,9 @@ def cmd_set_camera(params):
 _DEFAULT_RENDER_PATH = os.path.join(tempfile.gettempdir(), "blender_mcp_render.png")
 _DEFAULT_SCREENSHOT_PATH = os.path.join(tempfile.gettempdir(), "blender_mcp_viewport.png")
 _DEFAULT_THUMBNAIL_PATH = os.path.join(tempfile.gettempdir(), "blender_mcp_thumbnail.png")
+_DEFAULT_VIEWPORT_RENDER_PATH = os.path.join(tempfile.gettempdir(), "blender_mcp_viewport_render.png")
+_DEFAULT_AREA_SCREENSHOT_PATH = os.path.join(tempfile.gettempdir(), "blender_mcp_area_screenshot.png")
+_DEFAULT_WINDOW_SCREENSHOT_PATH = os.path.join(tempfile.gettempdir(), "blender_mcp_window_screenshot.png")
 
 
 def cmd_render_scene(params):
@@ -597,23 +604,92 @@ def cmd_render_scene(params):
     return result
 
 
+def cmd_render_viewport(params):
+    """Render using whatever engine/resolution/samples the scene already has
+    configured, unlike render_scene (which always overrides them) and
+    render_thumbnail (which always overrides them for speed)."""
+    _require_mapping(params, "params")
+    scene = bpy.context.scene
+    filepath_param = params.get("filepath") or _DEFAULT_VIEWPORT_RENDER_PATH
+    filepath_param = _require_string(filepath_param, "filepath", max_length=4096)
+    return_image = _require_bool(params.get("return_image", True), "return_image")
+    if scene.camera is None:
+        raise RuntimeError("Scene has no active camera; use set_camera first")
+
+    render = scene.render
+    saved = {
+        "filepath": render.filepath,
+        "file_format": render.image_settings.file_format,
+        "use_file_extension": render.use_file_extension,
+    }
+    filepath = bpy.path.abspath(filepath_param)
+    try:
+        render.filepath = filepath
+        render.image_settings.file_format = "PNG"
+        render.use_file_extension = False
+        render_result = bpy.ops.render.render(write_still=True)
+        if 'FINISHED' not in render_result:
+            raise RuntimeError(f"Render did not complete (result: {render_result!r})")
+    finally:
+        render.filepath = saved["filepath"]
+        render.image_settings.file_format = saved["file_format"]
+        render.use_file_extension = saved["use_file_extension"]
+
+    result = {"filepath": filepath}
+    if return_image:
+        with open(filepath, "rb") as f:
+            result["image_base64"] = base64.b64encode(f.read()).decode("ascii")
+    return result
+
+
+def _screenshot_area(area_type, filepath):
+    for window in bpy.context.window_manager.windows:
+        for area in window.screen.areas:
+            if area.type == area_type:
+                with bpy.context.temp_override(window=window, area=area):
+                    shot_result = bpy.ops.screen.screenshot_area(filepath=filepath)
+                if 'FINISHED' not in shot_result:
+                    raise RuntimeError(f"Screenshot did not complete (result: {shot_result!r})")
+                with open(filepath, "rb") as f:
+                    return base64.b64encode(f.read()).decode("ascii")
+    raise RuntimeError(f"No '{area_type}' area found to screenshot")
+
+
 def cmd_get_viewport_screenshot(params):
     _require_mapping(params, "params")
     filepath_param = _require_string(
         params.get("filepath") or _DEFAULT_SCREENSHOT_PATH, "filepath", max_length=4096
     )
     filepath = bpy.path.abspath(filepath_param)
-    for window in bpy.context.window_manager.windows:
-        for area in window.screen.areas:
-            if area.type == "VIEW_3D":
-                with bpy.context.temp_override(window=window, area=area):
-                    shot_result = bpy.ops.screen.screenshot_area(filepath=filepath)
-                if 'FINISHED' not in shot_result:
-                    raise RuntimeError(f"Screenshot did not complete (result: {shot_result!r})")
-                with open(filepath, "rb") as f:
-                    data = base64.b64encode(f.read()).decode("ascii")
-                return {"filepath": filepath, "image_base64": data}
-    raise RuntimeError("No VIEW_3D area found to screenshot")
+    data = _screenshot_area("VIEW_3D", filepath)
+    return {"filepath": filepath, "image_base64": data}
+
+
+def cmd_get_screenshot_of_area(params):
+    _require_mapping(params, "params")
+    area_type = _require_string(params.get("area_type", "VIEW_3D"), "area_type", max_length=64)
+    filepath_param = _require_string(
+        params.get("filepath") or _DEFAULT_AREA_SCREENSHOT_PATH, "filepath", max_length=4096
+    )
+    filepath = bpy.path.abspath(filepath_param)
+    data = _screenshot_area(area_type, filepath)
+    return {"filepath": filepath, "image_base64": data}
+
+
+def cmd_get_screenshot_of_window(params):
+    _require_mapping(params, "params")
+    filepath_param = _require_string(
+        params.get("filepath") or _DEFAULT_WINDOW_SCREENSHOT_PATH, "filepath", max_length=4096
+    )
+    filepath = bpy.path.abspath(filepath_param)
+    if not bpy.context.window_manager.windows:
+        raise RuntimeError("No window available to screenshot")
+    shot_result = bpy.ops.screen.screenshot(filepath=filepath)
+    if 'FINISHED' not in shot_result:
+        raise RuntimeError(f"Screenshot did not complete (result: {shot_result!r})")
+    with open(filepath, "rb") as f:
+        data = base64.b64encode(f.read()).decode("ascii")
+    return {"filepath": filepath, "image_base64": data}
 
 
 def _save_selection():
@@ -1057,12 +1133,7 @@ def cmd_get_window_summary(params):
     }
 
 
-def cmd_jump_to_view3d_object(params):
-    _require_mapping(params, "params")
-    name = _require_name(params)
-    obj = _get_scene_object(name)
-    if obj is None:
-        raise ValueError(f"No object named '{name}'")
+def _focus_view3d_on_object(obj):
     for obj_iter in bpy.context.view_layer.objects:
         obj_iter.select_set(False)
     obj.select_set(True)
@@ -1073,8 +1144,66 @@ def cmd_jump_to_view3d_object(params):
                 region = next((r for r in area.regions if r.type == "WINDOW"), None)
                 with bpy.context.temp_override(window=window, area=area, region=region):
                     bpy.ops.view3d.view_selected()
-                return {"focused": name}
+                return
     raise RuntimeError("No VIEW_3D area found to focus")
+
+
+def cmd_jump_to_view3d_object(params):
+    _require_mapping(params, "params")
+    name = _require_name(params)
+    obj = _get_scene_object(name)
+    if obj is None:
+        raise ValueError(f"No object named '{name}'")
+    _focus_view3d_on_object(obj)
+    return {"focused": name}
+
+
+def cmd_jump_to_view3d_object_data(params):
+    _require_mapping(params, "params")
+    data_name = _require_name(params)
+    target = next(
+        (
+            obj for obj in bpy.context.scene.objects
+            if obj.data is not None and obj.data.name == data_name
+        ),
+        None,
+    )
+    if target is None:
+        raise ValueError(f"No object in the scene uses a data-block named '{data_name}'")
+    _focus_view3d_on_object(target)
+    return {"focused": target.name, "data_name": data_name}
+
+
+def cmd_jump_to_tab_by_name(params):
+    _require_mapping(params, "params")
+    name = _require_name(params)
+    workspace = bpy.data.workspaces.get(name)
+    if workspace is None:
+        raise ValueError(f"No workspace named '{name}'")
+    windows = list(bpy.context.window_manager.windows)
+    if not windows:
+        raise RuntimeError("No window available to switch workspace on")
+    for window in windows:
+        window.workspace = workspace
+    return {"workspace": workspace.name}
+
+
+def cmd_jump_to_tab_by_space_type(params):
+    _require_mapping(params, "params")
+    space_type = _require_string(params.get("space_type", ""), "space_type", max_length=64)
+    for workspace in bpy.data.workspaces:
+        if any(
+            area.type == space_type
+            for screen in workspace.screens
+            for area in screen.areas
+        ):
+            windows = list(bpy.context.window_manager.windows)
+            if not windows:
+                raise RuntimeError("No window available to switch workspace on")
+            for window in windows:
+                window.workspace = workspace
+            return {"workspace": workspace.name}
+    raise ValueError(f"No workspace has a '{space_type}' area")
 
 
 def cmd_render_thumbnail(params):
@@ -1383,6 +1512,12 @@ _HANDLERS = {
     "get_blendfile_summary_path_info": cmd_get_blendfile_summary_path_info,
     "get_blendfile_summary_usage_guess": cmd_get_blendfile_summary_usage_guess,
     "get_python_api_docs": cmd_get_python_api_docs,
+    "render_viewport": cmd_render_viewport,
+    "get_screenshot_of_area": cmd_get_screenshot_of_area,
+    "get_screenshot_of_window": cmd_get_screenshot_of_window,
+    "jump_to_view3d_object_data": cmd_jump_to_view3d_object_data,
+    "jump_to_tab_by_name": cmd_jump_to_tab_by_name,
+    "jump_to_tab_by_space_type": cmd_jump_to_tab_by_space_type,
 }
 
 

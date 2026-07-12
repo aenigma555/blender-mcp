@@ -88,7 +88,7 @@ sun light, and render it."
 | Tool | Purpose |
 |---|---|
 | `get_scene_info` | List objects and their transforms (capped by `limit`, default 200, with `object_count`/`truncated` for big scenes) |
-| `get_object_info` | Mesh stats, modifiers, materials for one object |
+| `get_object_info` | Mesh stats, modifiers, materials, constraints, children, data-block name, and collections for one object |
 | `add_primitive` | Add cube/sphere/ico-sphere/cylinder/cone/plane/torus/monkey |
 | `delete_object` | Remove an object |
 | `set_transform` | Move/rotate/scale an object (rotation works in any rotation mode) |
@@ -123,6 +123,12 @@ sun light, and render it."
 | `get_blendfile_summary_path_info_for_cli` | Same as `get_blendfile_summary_path_info`, background/CLI mode |
 | `get_blendfile_summary_usage_guess_for_cli` | Same as `get_blendfile_summary_usage_guess`, background/CLI mode |
 | `execute_code_for_cli` | Same as `execute_code`, but runs unattended against `blend_file` in a background process; does **not** save automatically |
+| `render_viewport_to_path` | Render using whatever engine/resolution/samples the scene already has configured, without overriding them — unlike `render_scene`/`render_thumbnail` |
+| `get_screenshot_of_area_as_image` | Screenshot of one editor area by type (`VIEW_3D`, `NODE_EDITOR`, `PROPERTIES`, etc.), not just the 3D viewport |
+| `get_screenshot_of_window_as_image` | Screenshot of the entire window — every visible area combined |
+| `jump_to_view3d_object_data` | Select and frame the object using a given data-block name (mesh/curve/etc.), instead of an object name |
+| `jump_to_tab_by_name` | Switch every open window's active workspace tab by name (e.g. `Shading`, `Scripting`) |
+| `jump_to_tab_by_space_type` | Switch to whichever workspace has an area of a given editor type (e.g. `NODE_EDITOR`) |
 
 `execute_code` is the escape hatch for anything not covered above —
 bmesh editing, modifiers, geometry nodes, UV unwrapping, etc. `bpy`,
@@ -227,6 +233,15 @@ declared minimum version.
 - `get_blendfile_summary_usage_guess` is a heuristic based on what kinds of
   data-blocks are present (armatures, geometry-node groups, sequencer strips,
   etc.), not a real classifier — treat it as a starting hint, not fact.
+- `jump_to_tab_by_name`/`jump_to_tab_by_space_type` set `Window.workspace`,
+  which Blender applies on its next window-manager event tick rather than
+  synchronously — the switch is real and visible in the running Blender
+  session, but reading `window.workspace` back immediately afterward (e.g.
+  from `execute_code` in the same call) can still show the old tab.
+- The screenshot tools (`get_viewport_screenshot`,
+  `get_screenshot_of_area_as_image`, `get_screenshot_of_window_as_image`)
+  need a real display and only work against an interactive Blender session —
+  they are not available through CLI/background mode.
 - Localhost is the bridge's trust boundary, not an authentication mechanism.
   Any local process that can reach the port can invoke tools, and
   `execute_code` can run arbitrary Python with Blender/user permissions. Do

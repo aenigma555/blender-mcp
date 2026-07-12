@@ -436,6 +436,31 @@ class BlenderMCPHeadlessTests(unittest.TestCase):
         )
         self.assertLess(centroids[0].x * centroids[1].x, 0.0)
 
+    def test_get_object_info_reports_children_constraints_data_name_and_collections(
+        self,
+    ) -> None:
+        parent = bpy.data.objects.new("InfoParent", None)
+        bpy.context.scene.collection.objects.link(parent)
+        bpy.ops.mesh.primitive_cube_add()
+        child = bpy.context.active_object
+        child.parent = parent
+        child.constraints.new(type="COPY_LOCATION")
+        extra_collection = bpy.data.collections.new("InfoExtraCollection")
+        bpy.context.scene.collection.children.link(extra_collection)
+        extra_collection.objects.link(child)
+
+        child_info = ADDON.cmd_get_object_info({"name": child.name})
+        self.assertEqual(child_info["data_name"], child.data.name)
+        self.assertEqual(child_info["children"], [])
+        self.assertEqual(
+            child_info["constraints"], [{"name": "Copy Location", "type": "COPY_LOCATION"}]
+        )
+        self.assertEqual(sorted(child_info["collections"]), ["Collection", "InfoExtraCollection"])
+
+        parent_info = ADDON.cmd_get_object_info({"name": "InfoParent"})
+        self.assertEqual(parent_info["children"], [child.name])
+        self.assertIsNone(parent_info["data_name"])
+
     def test_scene_info_limit_and_validation(self) -> None:
         for index in range(4):
             obj = bpy.data.objects.new(f"InfoObject{index}", None)
@@ -861,6 +886,78 @@ class BlenderMCPHeadlessTests(unittest.TestCase):
         self.assertTrue(target.select_get())
         self.assertFalse(other.select_get())
         self.assertIs(bpy.context.view_layer.objects.active, target)
+
+    def test_jump_to_view3d_object_data_selects_owning_object(self) -> None:
+        with self.assertRaises(ValueError):
+            ADDON.cmd_jump_to_view3d_object_data({"name": "DoesNotExist"})
+
+        bpy.ops.mesh.primitive_cube_add()
+        cube = bpy.context.active_object
+        cube.select_set(False)
+        bpy.context.view_layer.objects.active = None
+
+        result = ADDON.cmd_jump_to_view3d_object_data({"name": cube.data.name})
+        self.assertEqual(result, {"focused": cube.name, "data_name": cube.data.name})
+        self.assertTrue(cube.select_get())
+        self.assertIs(bpy.context.view_layer.objects.active, cube)
+
+    def test_jump_to_tab_by_name_identifies_workspace_and_rejects_unknown(self) -> None:
+        # Window.workspace assignment is real but Blender only applies it on
+        # its next window-manager event tick (confirmed manually: a deferred
+        # bpy.app.timers check sees the switch, an immediate one does not).
+        # A single synchronous handler call in this test harness never gets
+        # that tick, so only the return value/validation is checked here -
+        # the assignment line itself is exercised either way.
+        target = next(
+            (w for w in bpy.data.workspaces if w.name != bpy.context.window_manager.windows[0].workspace.name),
+            None,
+        )
+        self.assertIsNotNone(target, "test file needs at least two workspaces")
+
+        result = ADDON.cmd_jump_to_tab_by_name({"name": target.name})
+        self.assertEqual(result, {"workspace": target.name})
+
+        with self.assertRaises(ValueError):
+            ADDON.cmd_jump_to_tab_by_name({"name": "NoSuchWorkspace"})
+
+    def test_jump_to_tab_by_space_type_finds_matching_workspace_and_rejects_unmatched(
+        self,
+    ) -> None:
+        result = ADDON.cmd_jump_to_tab_by_space_type({"space_type": "NODE_EDITOR"})
+        matched = bpy.data.workspaces[result["workspace"]]
+        self.assertTrue(
+            any(area.type == "NODE_EDITOR" for screen in matched.screens for area in screen.areas)
+        )
+
+        with self.assertRaises(ValueError):
+            ADDON.cmd_jump_to_tab_by_space_type({"space_type": "NOT_A_REAL_SPACE_TYPE"})
+
+    def test_get_screenshot_of_area_rejects_unknown_area_type_before_capturing(self) -> None:
+        # This path never reaches the real screenshot operator (which needs a
+        # display background mode doesn't have), so it's safe to test headless.
+        with self.assertRaises(RuntimeError):
+            ADDON.cmd_get_screenshot_of_area({"area_type": "NOT_A_REAL_AREA_TYPE"})
+
+    def test_render_viewport_requires_camera_and_preserves_resolution(self) -> None:
+        with self.assertRaises(RuntimeError):
+            ADDON.cmd_render_viewport({})
+
+        bpy.ops.object.camera_add(location=(5, -5, 5), rotation=(1.1, 0, 0.78))
+        bpy.context.scene.camera = bpy.context.active_object
+        render = bpy.context.scene.render
+        original_resolution = (render.resolution_x, render.resolution_y)
+        output_path = os.path.join(tempfile.gettempdir(), f"mcp_test_viewport_render_{uuid.uuid4().hex}.png")
+        try:
+            result = ADDON.cmd_render_viewport({"filepath": output_path})
+            self.assertEqual(result["filepath"], output_path)
+            self.assertIn("image_base64", result)
+            # Unlike render_scene/render_thumbnail, this must never touch resolution.
+            self.assertEqual((render.resolution_x, render.resolution_y), original_resolution)
+        finally:
+            try:
+                os.remove(output_path)
+            except OSError:
+                pass
 
     def test_render_thumbnail_limits_are_rejected_before_rendering(self) -> None:
         # No active camera, same as the render_scene equivalent test: invalid

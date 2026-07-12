@@ -28,6 +28,9 @@ CLI_RUNNER_PATH = Path(__file__).resolve().parent.parent / "addon" / "blender_mc
 DEFAULT_TIMEOUT = 120.0
 DEFAULT_RENDER_PATH = os.path.join(tempfile.gettempdir(), "blender_mcp_render.png")
 DEFAULT_THUMBNAIL_PATH = os.path.join(tempfile.gettempdir(), "blender_mcp_thumbnail.png")
+DEFAULT_VIEWPORT_RENDER_PATH = os.path.join(tempfile.gettempdir(), "blender_mcp_viewport_render.png")
+DEFAULT_AREA_SCREENSHOT_PATH = os.path.join(tempfile.gettempdir(), "blender_mcp_area_screenshot.png")
+DEFAULT_WINDOW_SCREENSHOT_PATH = os.path.join(tempfile.gettempdir(), "blender_mcp_window_screenshot.png")
 MAX_RESPONSE_BYTES = 64 * 1024 * 1024
 MAX_SCENE_INFO_LIMIT = 10_000
 MAX_RENDER_DIMENSION = 4096
@@ -303,8 +306,9 @@ def get_scene_info(limit: int = 200) -> dict:
 
 @mcp.tool()
 def get_object_info(name: str) -> dict:
-    """Get detailed info about one object: transform, mesh stats,
-    modifiers, and assigned materials."""
+    """Get detailed info about one object: transform, mesh stats, modifiers,
+    assigned materials, constraints, child object names, its data-block name,
+    and the collections it belongs to."""
     return _conn.send_command("get_object_info", {"name": name})
 
 
@@ -703,6 +707,68 @@ def get_python_api_docs(identifier: str) -> dict:
     an identifier with '*' after a trailing dot to list matches, e.g.
     'bpy.types.Mesh*' or 'bpy.ops.mesh.*'."""
     return _conn.send_command("get_python_api_docs", {"identifier": identifier})
+
+
+@mcp.tool()
+def render_viewport_to_path(
+    filepath: str = DEFAULT_VIEWPORT_RENDER_PATH,
+    timeout: float = 600,
+) -> Image:
+    """Render using whatever engine/resolution/samples the scene already has
+    configured, without overriding them. Unlike render_scene (always
+    overrides resolution/samples) and render_thumbnail (always forces a fast
+    low-quality preview), this reflects exactly what a normal Render >
+    Render Image would produce right now."""
+    timeout = _finite_number(timeout, "timeout", minimum=1.0e-6, maximum=MAX_TIMEOUT)
+    result = _conn.send_command(
+        "render_viewport", {"filepath": filepath, "return_image": True}, timeout=timeout
+    )
+    return _decode_png_result(result)
+
+
+@mcp.tool()
+def get_screenshot_of_area_as_image(area_type: str = "VIEW_3D") -> Image:
+    """Capture a screenshot of one editor area by type (e.g. 'VIEW_3D',
+    'NODE_EDITOR', 'IMAGE_EDITOR', 'PROPERTIES', 'OUTLINER') - the first area
+    of that type found across all open windows. Use get_viewport_screenshot
+    for the common 3D-viewport case; this covers any other editor."""
+    result = _conn.send_command("get_screenshot_of_area", {"area_type": area_type})
+    return _decode_png_result(result)
+
+
+@mcp.tool()
+def get_screenshot_of_window_as_image() -> Image:
+    """Capture a screenshot of the entire Blender window (every visible area
+    combined), unlike get_viewport_screenshot/get_screenshot_of_area_as_image
+    which capture a single area."""
+    result = _conn.send_command("get_screenshot_of_window", {})
+    return _decode_png_result(result)
+
+
+@mcp.tool()
+def jump_to_view3d_object_data(name: str) -> dict:
+    """Select and frame in the 3D viewport whichever object uses the
+    data-block named `name` (e.g. a mesh, curve, or armature data name),
+    rather than looking up an object by its own name like
+    jump_to_view3d_object does. Useful when several objects share one
+    mesh/data-block and you want to find them by that shared data's name."""
+    return _conn.send_command("jump_to_view3d_object_data", {"name": name})
+
+
+@mcp.tool()
+def jump_to_tab_by_name(name: str) -> dict:
+    """Switch every open window's active workspace tab to `name` (e.g.
+    'Shading', 'UV Editing', 'Animation', 'Scripting')."""
+    return _conn.send_command("jump_to_tab_by_name", {"name": name})
+
+
+@mcp.tool()
+def jump_to_tab_by_space_type(space_type: str) -> dict:
+    """Switch to whichever workspace has an area of the given editor type
+    (e.g. 'NODE_EDITOR', 'IMAGE_EDITOR', 'SEQUENCE_EDITOR') - use this when
+    you know what kind of editor you need but not which workspace tab has
+    it."""
+    return _conn.send_command("jump_to_tab_by_space_type", {"space_type": space_type})
 
 
 # ---------------------------------------------------------------------------
