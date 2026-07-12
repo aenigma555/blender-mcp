@@ -67,7 +67,9 @@ cd server
 uv sync            # or: pip install -e .
 ```
 
-### 3. Register it with Claude
+### 3. Register it with your MCP client
+
+#### Claude
 
 ```bash
 claude mcp add blender -- uv --directory /absolute/path/to/claude-plugin/server run blender_mcp_server.py
@@ -88,6 +90,25 @@ equivalent command and arguments in Claude Desktop's
 Then, with Blender open and the add-on's server started, ask Claude to
 build something — e.g. "add a cube, give it a red glossy material, add a
 sun light, and render it."
+
+#### Codex
+
+Register the same stdio MCP server with the Codex CLI:
+
+```bash
+codex mcp add blender -- uv --directory /absolute/path/to/claude-plugin/server run blender_mcp_server.py
+```
+
+If you installed with `pip` instead of `uv`, register the Python interpreter
+from that environment directly:
+
+```bash
+codex mcp add blender -- /absolute/path/to/venv/bin/python /absolute/path/to/claude-plugin/server/blender_mcp_server.py
+```
+
+Run `codex mcp list` to confirm that it is registered, then start a new Codex
+session. With Blender open and the add-on's server started, Codex can call the
+same Blender tools described below.
 
 ## Available tools
 
