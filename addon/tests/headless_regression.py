@@ -125,6 +125,7 @@ class BlenderMCPHeadlessTests(unittest.TestCase):
             "_last_server_error": ADDON._last_server_error,
             "_client_sockets": ADDON._client_sockets,
             "_online_access_allowed": ADDON._online_access_allowed,
+            "_running_in_background": ADDON._running_in_background,
             "_idle_countdown": ADDON._idle_countdown,
         }
         ADDON._command_queue = queue.Queue(maxsize=ADDON.MAX_PENDING_COMMANDS)
@@ -145,6 +146,10 @@ class BlenderMCPHeadlessTests(unittest.TestCase):
         # would otherwise fail every test that calls the real start_server();
         # only test_online_access_blocks_start_server exercises that path.
         ADDON._online_access_allowed = lambda: True
+        # This entire suite runs under `blender --background`, which would
+        # otherwise fail every test that calls the real start_server(); only
+        # test_start_server_blocks_in_background_mode exercises that path.
+        ADDON._running_in_background = lambda: False
 
     def tearDown(self) -> None:
         # A test may temporarily replace the add-on's bpy reference.
@@ -469,6 +474,23 @@ class BlenderMCPHeadlessTests(unittest.TestCase):
         self.assertEqual(parent_info["children"], [child.name])
         self.assertIsNone(parent_info["data_name"])
 
+    def test_get_object_info_world_bounding_box_accounts_for_rotation(self) -> None:
+        bpy.ops.mesh.primitive_cube_add(size=2.0, location=(10.0, 0.0, 0.0))
+        cube = bpy.context.active_object
+        cube.rotation_euler = (0.0, 0.0, math.radians(45.0))
+        bpy.context.view_layer.update()
+
+        info = ADDON.cmd_get_object_info({"name": cube.name})
+        min_corner, max_corner = info["world_bounding_box"]
+        # An unrotated 2x2x2 cube at (10,0,0) would have an AABB half-extent
+        # of 1.0 on every axis; a 45-degree rotation about Z grows the X/Y
+        # half-extent to sqrt(2) while Z is untouched, which is exactly what
+        # distinguishes this from the local-space `dimensions` field.
+        self.assertAlmostEqual(max_corner[0] - min_corner[0], 2 * math.sqrt(2), places=5)
+        self.assertAlmostEqual(max_corner[1] - min_corner[1], 2 * math.sqrt(2), places=5)
+        self.assertAlmostEqual(max_corner[2] - min_corner[2], 2.0, places=5)
+        self.assertAlmostEqual((min_corner[0] + max_corner[0]) / 2, 10.0, places=5)
+
     def test_scene_info_limit_and_validation(self) -> None:
         for index in range(4):
             obj = bpy.data.objects.new(f"InfoObject{index}", None)
@@ -521,6 +543,22 @@ class BlenderMCPHeadlessTests(unittest.TestCase):
 
         # And it must not have bound a socket that could leak/conflict.
         ADDON._online_access_allowed = lambda: True
+        ADDON.start_server(19876)
+        try:
+            self.assertTrue(ADDON._running)
+        finally:
+            ADDON.stop_server()
+
+    def test_start_server_blocks_in_background_mode(self) -> None:
+        ADDON._running = False
+        ADDON._running_in_background = lambda: True
+        with self.assertRaisesRegex(RuntimeError, "--background"):
+            ADDON.start_server(19876)
+        self.assertFalse(ADDON._running)
+        self.assertIsNone(ADDON._server_socket)
+
+        # And it must not have bound a socket that could leak/conflict.
+        ADDON._running_in_background = lambda: False
         ADDON.start_server(19876)
         try:
             self.assertTrue(ADDON._running)

@@ -358,7 +358,9 @@ def get_scene_info(limit: int = 200) -> dict:
 def get_object_info(name: str) -> dict:
     """Get detailed info about one object: transform, mesh stats, modifiers,
     assigned materials, constraints, child object names, its data-block name,
-    and the collections it belongs to."""
+    the collections it belongs to, and (for meshes) the world-space axis-aligned
+    bounding box, which accounts for rotation unlike the local-space `dimensions`
+    field."""
     return _conn.send_command("get_object_info", {"name": name})
 
 

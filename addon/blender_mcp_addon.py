@@ -153,6 +153,17 @@ def _online_access_allowed():
     return getattr(bpy.app, "online_access", True)
 
 
+def _running_in_background():
+    """Whether this Blender process was launched with --background. A wrapper
+    function (rather than reading bpy.app.background inline) so tests can
+    monkeypatch it - our own headless regression suite runs under
+    --background, and bpy.app.timers callbacks are never pumped there without
+    a window-manager event loop (confirmed empirically: a registered timer
+    does not fire even across a multi-second real-time sleep), so the queue
+    this add-on relies on to drain commands would never run for real."""
+    return bpy.app.background
+
+
 def _log_enabled():
     try:
         return bool(bpy.context.scene.blender_mcp_settings.use_log)
@@ -215,6 +226,15 @@ def cmd_get_scene_info(params):
     }
 
 
+def _world_bounding_box(obj):
+    """World-space AABB corners; differs from obj.dimensions when the object
+    or an ancestor is rotated, since dimensions is measured in local space."""
+    corners = [obj.matrix_world @ Vector(corner) for corner in obj.bound_box]
+    min_corner = Vector(map(min, zip(*corners)))
+    max_corner = Vector(map(max, zip(*corners)))
+    return [list(min_corner), list(max_corner)]
+
+
 def cmd_get_object_info(params):
     _require_mapping(params, "params")
     name = _require_name(params)
@@ -229,6 +249,7 @@ def cmd_get_object_info(params):
             "edges": len(mesh.edges),
             "polygons": len(mesh.polygons),
         }
+        info["world_bounding_box"] = _world_bounding_box(obj)
     info["modifiers"] = [{"name": m.name, "type": m.type} for m in obj.modifiers]
     # Material slots may be empty (None); report them as null rather than crash.
     info["materials"] = (
@@ -2261,6 +2282,16 @@ def start_server(port):
         if _server_thread is not None and _server_thread.is_alive():
             return
         stop_server()
+    if _running_in_background():
+        raise RuntimeError(
+            "Cannot start the MCP server in Blender's --background mode: the "
+            "command queue is drained by a bpy.app.timers callback, which "
+            "requires a running window-manager event loop that --background "
+            "never starts, so queued commands would sit forever and every "
+            "call would time out. Run Blender with a GUI, use 'xvfb-run -a "
+            "blender' for a virtual display, or use the *_for_cli tools "
+            "instead, which run in their own one-shot background process."
+        )
     if not _online_access_allowed():
         raise RuntimeError(
             "Online access is disabled in Blender's system preferences; enable it "

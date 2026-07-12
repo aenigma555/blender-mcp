@@ -94,7 +94,7 @@ sun light, and render it."
 | Tool | Purpose |
 |---|---|
 | `get_scene_info` | List objects and their transforms (capped by `limit`, default 200, with `object_count`/`truncated` for big scenes) |
-| `get_object_info` | Mesh stats, modifiers, materials, constraints, children, data-block name, and collections for one object |
+| `get_object_info` | Mesh stats, modifiers, materials, constraints, children, data-block name, collections, and (for meshes) world-space bounding box for one object |
 | `add_primitive` | Add cube/sphere/ico-sphere/cylinder/cone/plane/torus/monkey |
 | `delete_object` | Remove an object |
 | `set_transform` | Move/rotate/scale an object (rotation works in any rotation mode) |
@@ -223,6 +223,13 @@ declared minimum version.
   isn't, `start_server` refuses with a clear error rather than silently
   opening a socket anyway. Whether binding to localhost really counts as
   "online" is a grey area, but this errs conservative.
+- `start_server` also refuses to start under `blender --background`: the
+  command queue is drained by a `bpy.app.timers` callback, which needs a
+  running window-manager event loop that `--background` never starts, so a
+  socket bound there would accept connections whose commands sit forever and
+  every call would time out. Use a GUI session, `xvfb-run -a blender` for a
+  virtual display, or the `*_for_cli` tools, which run in their own one-shot
+  background process instead of relying on the timer-driven queue.
 - Each command has a unique request ID, and Blender returns a cached response
   when it receives the same ID and payload again. Cached responses are bounded
   and expire, so request IDs are not a permanent transaction log. The MCP
