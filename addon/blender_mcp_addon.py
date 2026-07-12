@@ -11,6 +11,7 @@ bl_info = {
 import base64
 from collections import OrderedDict
 import hashlib
+import inspect
 import json
 import math
 import os
@@ -43,6 +44,8 @@ MAX_RENDER_SAMPLES = 4096
 MAX_JOIN_OBJECTS = 256
 MAX_UNDO_STEPS = 100
 MAX_EXECUTE_CODE_BYTES = 8 * 1024 * 1024
+MAX_THUMBNAIL_DIMENSION = 512
+MAX_API_DOCS_MATCHES = 200
 
 _server_socket = None
 _server_thread = None
@@ -514,6 +517,7 @@ def cmd_set_camera(params):
 
 _DEFAULT_RENDER_PATH = os.path.join(tempfile.gettempdir(), "blender_mcp_render.png")
 _DEFAULT_SCREENSHOT_PATH = os.path.join(tempfile.gettempdir(), "blender_mcp_viewport.png")
+_DEFAULT_THUMBNAIL_PATH = os.path.join(tempfile.gettempdir(), "blender_mcp_thumbnail.png")
 
 
 def cmd_render_scene(params):
@@ -999,6 +1003,347 @@ def cmd_save_file(params):
     return {"saved": bpy.data.filepath}
 
 
+# ---------------------------------------------------------------------------
+# Introspection / analysis commands (all read-only; none push undo steps)
+# ---------------------------------------------------------------------------
+
+def cmd_get_objects_summary(params):
+    _require_mapping(params, "params")
+
+    def collection_summary(collection, visited):
+        if collection.name in visited:
+            # Blender doesn't normally allow collection cycles, but don't
+            # let a corrupt file recurse forever.
+            return {"name": collection.name, "recursive": True}
+        visited = visited | {collection.name}
+        return {
+            "name": collection.name,
+            "objects": [obj.name for obj in collection.objects],
+            "children": [collection_summary(child, visited) for child in collection.children],
+        }
+
+    scene = bpy.context.scene
+    return {
+        "scene_name": scene.name,
+        "collection": collection_summary(scene.collection, frozenset()),
+    }
+
+
+def cmd_get_window_summary(params):
+    _require_mapping(params, "params")
+    windows = []
+    for window in bpy.context.window_manager.windows:
+        areas = [
+            {
+                "type": area.type,
+                "x": area.x,
+                "y": area.y,
+                "width": area.width,
+                "height": area.height,
+            }
+            for area in window.screen.areas
+        ]
+        windows.append({
+            "workspace": window.workspace.name if window.workspace else None,
+            "screen": window.screen.name if window.screen else None,
+            "areas": areas,
+        })
+    view_layer = bpy.context.view_layer
+    return {
+        "windows": windows,
+        "mode": bpy.context.mode,
+        "active_object": view_layer.objects.active.name if view_layer.objects.active else None,
+        "selected_objects": [o.name for o in bpy.context.selected_objects],
+    }
+
+
+def cmd_jump_to_view3d_object(params):
+    _require_mapping(params, "params")
+    name = _require_name(params)
+    obj = _get_scene_object(name)
+    if obj is None:
+        raise ValueError(f"No object named '{name}'")
+    for obj_iter in bpy.context.view_layer.objects:
+        obj_iter.select_set(False)
+    obj.select_set(True)
+    bpy.context.view_layer.objects.active = obj
+    for window in bpy.context.window_manager.windows:
+        for area in window.screen.areas:
+            if area.type == "VIEW_3D":
+                region = next((r for r in area.regions if r.type == "WINDOW"), None)
+                with bpy.context.temp_override(window=window, area=area, region=region):
+                    bpy.ops.view3d.view_selected()
+                return {"focused": name}
+    raise RuntimeError("No VIEW_3D area found to focus")
+
+
+def cmd_render_thumbnail(params):
+    _require_mapping(params, "params")
+    scene = bpy.context.scene
+    size = _require_int(params.get("size", 128), "size", minimum=1, maximum=MAX_THUMBNAIL_DIMENSION)
+    filepath_param = params.get("filepath") or _DEFAULT_THUMBNAIL_PATH
+    filepath_param = _require_string(filepath_param, "filepath", max_length=4096)
+    return_image = _require_bool(params.get("return_image", True), "return_image")
+    if scene.camera is None:
+        raise RuntimeError("Scene has no active camera; use set_camera first")
+
+    render = scene.render
+    saved = {
+        "resolution_x": render.resolution_x,
+        "resolution_y": render.resolution_y,
+        "resolution_percentage": render.resolution_percentage,
+        "filepath": render.filepath,
+        "file_format": render.image_settings.file_format,
+        "use_file_extension": render.use_file_extension,
+        "engine": render.engine,
+    }
+    filepath = bpy.path.abspath(filepath_param)
+    try:
+        render.resolution_x = size
+        render.resolution_y = size
+        render.resolution_percentage = 100
+        render.filepath = filepath
+        render.image_settings.file_format = "PNG"
+        render.use_file_extension = False
+        try:
+            # Thumbnails favor speed over fidelity; Workbench is available on
+            # every build and skips ray tracing / sample convergence entirely.
+            render.engine = "BLENDER_WORKBENCH"
+        except TypeError:
+            pass
+        render_result = bpy.ops.render.render(write_still=True)
+        if 'FINISHED' not in render_result:
+            raise RuntimeError(f"Render did not complete (result: {render_result!r})")
+    finally:
+        render.resolution_x = saved["resolution_x"]
+        render.resolution_y = saved["resolution_y"]
+        render.resolution_percentage = saved["resolution_percentage"]
+        render.filepath = saved["filepath"]
+        render.image_settings.file_format = saved["file_format"]
+        render.use_file_extension = saved["use_file_extension"]
+        render.engine = saved["engine"]
+
+    result = {"filepath": filepath}
+    if return_image:
+        with open(filepath, "rb") as f:
+            result["image_base64"] = base64.b64encode(f.read()).decode("ascii")
+    return result
+
+
+def cmd_get_blendfile_summary_datablocks(params):
+    _require_mapping(params, "params")
+    counts = {}
+    for attr in dir(bpy.data):
+        if attr.startswith("_"):
+            continue
+        collection = getattr(bpy.data, attr, None)
+        if isinstance(collection, bpy.types.bpy_prop_collection):
+            counts[attr] = len(collection)
+    return {
+        "datablock_counts": counts,
+        "active_workspace": bpy.context.workspace.name if bpy.context.workspace else None,
+        "render_engine": bpy.context.scene.render.engine,
+    }
+
+
+_MISSING_FILE_CATEGORIES = (
+    "images", "libraries", "fonts", "sounds", "movieclips", "cache_files",
+)
+
+
+def cmd_get_blendfile_summary_missing_files(params):
+    _require_mapping(params, "params")
+    missing = []
+    for category in _MISSING_FILE_CATEGORIES:
+        collection = getattr(bpy.data, category, None)
+        if collection is None:
+            continue
+        for block in collection:
+            filepath = getattr(block, "filepath", "") or ""
+            if not filepath or filepath.startswith("<"):
+                continue
+            # Packed data-blocks embed their bytes in the .blend file itself,
+            # so a missing on-disk path is expected, not an error.
+            if getattr(block, "packed_file", None) is not None:
+                continue
+            if not os.path.exists(bpy.path.abspath(filepath)):
+                missing.append({"category": category, "name": block.name, "filepath": filepath})
+    return {"missing_count": len(missing), "missing": missing}
+
+
+def cmd_get_blendfile_summary_linked_libraries(params):
+    _require_mapping(params, "params")
+    libraries = list(bpy.data.libraries)
+    by_name = {lib.name: lib for lib in libraries}
+    children = {lib.name: [] for lib in libraries}
+    roots = []
+    for lib in libraries:
+        parent = lib.parent
+        if parent is not None and parent.name in children:
+            children[parent.name].append(lib.name)
+        else:
+            roots.append(lib.name)
+
+    def build(name, visited):
+        if name in visited:
+            return {"name": name, "recursive": True}
+        visited = visited | {name}
+        lib = by_name[name]
+        return {
+            "name": lib.name,
+            "filepath": lib.filepath,
+            "children": [build(child, visited) for child in children[name]],
+        }
+
+    return {"libraries": [build(name, frozenset()) for name in roots]}
+
+
+def cmd_get_blendfile_summary_path_info(params):
+    _require_mapping(params, "params")
+    filepath = bpy.data.filepath
+    is_saved = bool(filepath)
+    result = {
+        "filepath": filepath or None,
+        "is_saved": is_saved,
+        "is_dirty": bool(bpy.data.is_dirty),
+    }
+    if is_saved:
+        abs_path = bpy.path.abspath(filepath)
+        if os.path.exists(abs_path):
+            stat = os.stat(abs_path)
+            result["file_size_bytes"] = stat.st_size
+            result["seconds_since_saved"] = max(0.0, time.time() - stat.st_mtime)
+        backup_dir = os.path.dirname(abs_path) or "."
+        base_name = os.path.basename(abs_path)
+        try:
+            result["backup_count"] = sum(
+                1 for entry in os.listdir(backup_dir)
+                if entry != base_name and entry.startswith(base_name)
+            )
+        except OSError:
+            result["backup_count"] = 0
+    return result
+
+
+def cmd_get_blendfile_summary_usage_guess(params):
+    _require_mapping(params, "params")
+    scene = bpy.context.scene
+    signals = []
+
+    def add(label, score, reason):
+        signals.append({"label": label, "score": min(100, score), "reason": reason})
+
+    armature_count = len(bpy.data.armatures)
+    if armature_count:
+        add("character_rigging", 40 + armature_count * 20,
+            f"{armature_count} armature data-block(s) present")
+
+    geo_node_group_count = sum(1 for g in bpy.data.node_groups if g.type == "GEOMETRY")
+    if geo_node_group_count:
+        add("procedural_geometry_nodes", 30 + geo_node_group_count * 15,
+            f"{geo_node_group_count} geometry-node group(s) present")
+
+    sequence_editor = scene.sequence_editor
+    # Blender 5.0 renamed VSE `sequences` to `strips_all`; support both so this
+    # works across the addon's declared minimum (4.0) and current versions.
+    strips = getattr(sequence_editor, "strips_all", None)
+    if strips is None:
+        strips = getattr(sequence_editor, "sequences", None)
+    strip_count = len(strips) if strips is not None else 0
+    if strip_count:
+        add("video_editing", 50 + strip_count * 5, f"{strip_count} sequencer strip(s) present")
+
+    compositor_tree = getattr(scene, "node_tree", None)
+    node_count = len(compositor_tree.nodes) if scene.use_nodes and compositor_tree else 0
+    if node_count > 2:
+        add("compositing", 30 + node_count * 3, f"{node_count} compositor node(s) present")
+
+    grease_pencil_count = len(bpy.data.grease_pencils)
+    if grease_pencil_count:
+        add("2d_animation_grease_pencil", 40 + grease_pencil_count * 20,
+            f"{grease_pencil_count} grease pencil data-block(s) present")
+
+    material_count = len(bpy.data.materials)
+    mesh_count = len(bpy.data.meshes)
+    if material_count and mesh_count and not armature_count and not geo_node_group_count:
+        add("static_asset_lookdev", 20 + material_count * 5,
+            f"{material_count} material(s) on {mesh_count} mesh(es), "
+            "no rigging or procedural setup detected")
+
+    signals.sort(key=lambda s: s["score"], reverse=True)
+    return {"guesses": signals}
+
+
+def _resolve_api_identifier(path):
+    parts = path.split(".")
+    if not parts or parts[0] != "bpy":
+        raise ValueError("identifier must start with 'bpy'")
+    target = bpy
+    for part in parts[1:]:
+        target = getattr(target, part)
+    return target
+
+
+def cmd_get_python_api_docs(params):
+    _require_mapping(params, "params")
+    identifier = _require_string(params["identifier"], "identifier", max_length=256)
+
+    if identifier.endswith("*"):
+        container_path, _, name_prefix = identifier[:-1].rpartition(".")
+        if not container_path:
+            raise ValueError("wildcard identifiers must look like 'bpy.types.Mesh*'")
+        try:
+            container = _resolve_api_identifier(container_path)
+        except AttributeError as exc:
+            raise ValueError(f"Unknown identifier '{container_path}': {exc}") from None
+        matches = sorted(
+            name for name in dir(container)
+            if not name.startswith("_") and name.startswith(name_prefix)
+        )
+        return {"identifier": identifier, "matches": matches[:MAX_API_DOCS_MATCHES]}
+
+    try:
+        target = _resolve_api_identifier(identifier)
+    except AttributeError:
+        # RNA properties (e.g. bpy.types.Object.location) are exposed through
+        # bl_rna.properties, not as plain Python class attributes; fall back
+        # to that lookup before giving up.
+        parent_path, _, prop_name = identifier.rpartition(".")
+        parent = None
+        if parent_path:
+            try:
+                parent = _resolve_api_identifier(parent_path)
+            except AttributeError:
+                parent = None
+        bl_rna = getattr(parent, "bl_rna", None) if parent is not None else None
+        prop = bl_rna.properties.get(prop_name) if bl_rna is not None else None
+        if prop is None:
+            raise ValueError(f"Unknown identifier '{identifier}'") from None
+        return {
+            "identifier": identifier,
+            "doc": prop.description,
+            "type": prop.type,
+        }
+
+    result = {"identifier": identifier, "doc": (target.__doc__ or "").strip()}
+    bl_rna = getattr(target, "bl_rna", None)
+    if bl_rna is not None:
+        result["properties"] = [
+            {"name": prop.identifier, "type": prop.type, "description": prop.description}
+            for prop in bl_rna.properties
+            if prop.identifier != "rna_type"
+        ]
+        functions = getattr(bl_rna, "functions", None)
+        if functions:
+            result["functions"] = [f.identifier for f in functions]
+    elif callable(target):
+        try:
+            result["signature"] = str(inspect.signature(target))
+        except (TypeError, ValueError):
+            pass
+    return result
+
+
 _MUTATING_COMMANDS = {
     "add_primitive", "delete_object", "set_transform", "create_material",
     "assign_material", "add_light", "set_camera", "add_capsule",
@@ -1028,6 +1373,16 @@ _HANDLERS = {
     "redo": cmd_redo,
     "execute_code": cmd_execute_code,
     "save_file": cmd_save_file,
+    "get_objects_summary": cmd_get_objects_summary,
+    "get_window_summary": cmd_get_window_summary,
+    "jump_to_view3d_object": cmd_jump_to_view3d_object,
+    "render_thumbnail": cmd_render_thumbnail,
+    "get_blendfile_summary_datablocks": cmd_get_blendfile_summary_datablocks,
+    "get_blendfile_summary_missing_files": cmd_get_blendfile_summary_missing_files,
+    "get_blendfile_summary_linked_libraries": cmd_get_blendfile_summary_linked_libraries,
+    "get_blendfile_summary_path_info": cmd_get_blendfile_summary_path_info,
+    "get_blendfile_summary_usage_guess": cmd_get_blendfile_summary_usage_guess,
+    "get_python_api_docs": cmd_get_python_api_docs,
 }
 
 
@@ -1262,8 +1617,18 @@ def _process_queue():
             # A broken response queue must not unregister Blender's timer. The
             # waiting client will observe its normal connection/timeout error.
             pass
-    # Drain fast while commands are waiting, idle politely otherwise.
-    return 0.0 if not _command_queue.empty() else 0.05
+    # Drain fast while commands are waiting, idle politely otherwise. Both
+    # rates are user-configurable (preferences panel) to trade latency for
+    # idle CPU overhead; fall back to the historical defaults if the scene
+    # property isn't available yet (e.g. during registration or in tests).
+    active_interval, idle_interval = 0.0, 0.05
+    try:
+        settings = bpy.context.scene.blender_mcp_settings
+        active_interval = max(0.0, float(settings.poll_interval_active))
+        idle_interval = max(0.0, float(settings.poll_interval_idle))
+    except BaseException:
+        pass
+    return active_interval if not _command_queue.empty() else idle_interval
 
 
 def _send_response(conn, response):
@@ -1545,6 +1910,23 @@ def stop_server():
 
 class MCP_PG_settings(bpy.types.PropertyGroup):
     port: bpy.props.IntProperty(name="Port", default=9876, min=1024, max=65535)
+    auto_start: bpy.props.BoolProperty(
+        name="Auto-start on load",
+        description="Start the MCP server automatically when this file is opened "
+        "or the add-on is enabled. Failures are non-blocking and shown here.",
+        default=False,
+    )
+    poll_interval_active: bpy.props.FloatProperty(
+        name="Active poll interval",
+        description="Seconds between command-queue checks while commands are pending",
+        default=0.0, min=0.0, max=1.0,
+    )
+    poll_interval_idle: bpy.props.FloatProperty(
+        name="Idle poll interval",
+        description="Seconds between command-queue checks while idle, to avoid "
+        "excessive overhead",
+        default=0.05, min=0.0, max=5.0,
+    )
 
 
 class MCP_OT_start(bpy.types.Operator):
@@ -1592,18 +1974,41 @@ class MCP_PT_panel(bpy.types.Panel):
                 layout.label(text=_last_server_error, icon="ERROR")
             layout.prop(settings, "port")
             layout.operator("mcp.start_server")
+        layout.prop(settings, "auto_start")
+        col = layout.column(align=True)
+        col.prop(settings, "poll_interval_active")
+        col.prop(settings, "poll_interval_idle")
 
 
 _classes = (MCP_PG_settings, MCP_OT_start, MCP_OT_stop, MCP_PT_panel)
+
+
+def _auto_start_handler(*_args, **_kwargs):
+    """Non-blocking: failures are recorded for the panel, never raised, so a
+    bad port/auto-start setting can't stop a file from loading."""
+    global _last_server_error
+    try:
+        scene = bpy.context.scene
+        settings = getattr(scene, "blender_mcp_settings", None) if scene else None
+        if settings is None or not settings.auto_start or _running:
+            return
+        start_server(settings.port)
+    except BaseException as exc:
+        _last_server_error = f"Auto-start failed: {_safe_exception_text(exc)}"
 
 
 def register():
     for cls in _classes:
         bpy.utils.register_class(cls)
     bpy.types.Scene.blender_mcp_settings = bpy.props.PointerProperty(type=MCP_PG_settings)
+    if _auto_start_handler not in bpy.app.handlers.load_post:
+        bpy.app.handlers.load_post.append(_auto_start_handler)
+    _auto_start_handler()
 
 
 def unregister():
+    if _auto_start_handler in bpy.app.handlers.load_post:
+        bpy.app.handlers.load_post.remove(_auto_start_handler)
     stop_server()
     del bpy.types.Scene.blender_mcp_settings
     for cls in reversed(_classes):

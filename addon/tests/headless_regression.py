@@ -790,6 +790,195 @@ class BlenderMCPHeadlessTests(unittest.TestCase):
         self.assertEqual(response["status"], "error")
         self.assertNotEqual(response.get("id"), oversized_id)
 
+    def test_get_objects_summary_reports_collection_hierarchy(self) -> None:
+        child = bpy.data.collections.new("ChildCollection")
+        bpy.context.scene.collection.children.link(child)
+        obj = bpy.data.objects.new("HierarchyObject", None)
+        child.objects.link(obj)
+
+        summary = ADDON.cmd_get_objects_summary({})
+        top = summary["collection"]
+        self.assertEqual(top["name"], bpy.context.scene.collection.name)
+        nested = next(c for c in top["children"] if c["name"] == "ChildCollection")
+        self.assertEqual(nested["objects"], ["HierarchyObject"])
+
+    def test_get_window_summary_reports_mode_and_selection(self) -> None:
+        obj = bpy.data.objects.new("SelectedObject", None)
+        bpy.context.scene.collection.objects.link(obj)
+        obj.select_set(True)
+        bpy.context.view_layer.objects.active = obj
+
+        summary = ADDON.cmd_get_window_summary({})
+        self.assertEqual(summary["mode"], "OBJECT")
+        self.assertEqual(summary["active_object"], "SelectedObject")
+        self.assertIn("SelectedObject", summary["selected_objects"])
+        self.assertIsInstance(summary["windows"], list)
+
+    def test_jump_to_view3d_object_selects_and_requires_existing_object(self) -> None:
+        with self.assertRaises(ValueError):
+            ADDON.cmd_jump_to_view3d_object({"name": "DoesNotExist"})
+
+        target = bpy.data.objects.new("JumpTarget", None)
+        bpy.context.scene.collection.objects.link(target)
+        other = bpy.data.objects.new("OtherObject", None)
+        bpy.context.scene.collection.objects.link(other)
+        other.select_set(True)
+
+        result = ADDON.cmd_jump_to_view3d_object({"name": "JumpTarget"})
+        self.assertEqual(result, {"focused": "JumpTarget"})
+        self.assertTrue(target.select_get())
+        self.assertFalse(other.select_get())
+        self.assertIs(bpy.context.view_layer.objects.active, target)
+
+    def test_render_thumbnail_limits_are_rejected_before_rendering(self) -> None:
+        # No active camera, same as the render_scene equivalent test: invalid
+        # size must fail validation before the handler reaches that check.
+        for invalid_size in (0, -1, 999999, 512.5, True):
+            with self.subTest(size=invalid_size):
+                with self.assertRaises((TypeError, ValueError)):
+                    ADDON.cmd_render_thumbnail({"size": invalid_size})
+        with self.assertRaises(RuntimeError):
+            ADDON.cmd_render_thumbnail({"size": 16})
+
+    def test_get_blendfile_summary_datablocks_counts_present_types(self) -> None:
+        bpy.data.objects.new("CountedObject", None)
+        summary = ADDON.cmd_get_blendfile_summary_datablocks({})
+        counts = summary["datablock_counts"]
+        self.assertGreaterEqual(counts["objects"], 1)
+        self.assertIn("render_engine", summary)
+        self.assertIn("active_workspace", summary)
+
+    def test_get_blendfile_summary_missing_files_flags_absent_paths_and_skips_packed(
+        self,
+    ) -> None:
+        missing_image = bpy.data.images.new("MissingImage", 1, 1)
+        missing_image.source = "FILE"
+        missing_image.filepath = "//does/not/exist.png"
+
+        packed_image = bpy.data.images.new("PackedImage", 1, 1)
+        packed_image.pack()
+
+        summary = ADDON.cmd_get_blendfile_summary_missing_files({})
+        flagged_names = {entry["name"] for entry in summary["missing"]}
+        self.assertIn("MissingImage", flagged_names)
+        self.assertNotIn("PackedImage", flagged_names)
+
+    def test_get_blendfile_summary_path_info_reports_unsaved_state(self) -> None:
+        real_bpy = ADDON.bpy
+        try:
+            ADDON.bpy = SimpleNamespace(
+                data=SimpleNamespace(filepath="", is_dirty=False),
+            )
+            info = ADDON.cmd_get_blendfile_summary_path_info({})
+        finally:
+            ADDON.bpy = real_bpy
+        self.assertFalse(info["is_saved"])
+        self.assertIsNone(info["filepath"])
+        self.assertNotIn("file_size_bytes", info)
+
+    def test_get_blendfile_summary_usage_guess_detects_armature_signal(self) -> None:
+        bpy.data.armatures.new("TestArmature")
+        summary = ADDON.cmd_get_blendfile_summary_usage_guess({})
+        labels = {g["label"] for g in summary["guesses"]}
+        self.assertIn("character_rigging", labels)
+        # Guesses must be sorted highest-score first.
+        scores = [g["score"] for g in summary["guesses"]]
+        self.assertEqual(scores, sorted(scores, reverse=True))
+
+    def test_get_python_api_docs_resolves_types_properties_and_wildcards(self) -> None:
+        type_doc = ADDON.cmd_get_python_api_docs({"identifier": "bpy.types.Object"})
+        self.assertEqual(type_doc["identifier"], "bpy.types.Object")
+        self.assertTrue(any(p["name"] == "name" for p in type_doc["properties"]))
+
+        prop_doc = ADDON.cmd_get_python_api_docs({"identifier": "bpy.types.Object.location"})
+        self.assertEqual(prop_doc["type"], "FLOAT")
+        self.assertIn("Location", prop_doc["doc"])
+
+        wildcard = ADDON.cmd_get_python_api_docs({"identifier": "bpy.types.Mesh*"})
+        self.assertIn("Mesh", wildcard["matches"])
+        self.assertTrue(all(name.startswith("Mesh") for name in wildcard["matches"]))
+
+    def test_get_python_api_docs_rejects_non_bpy_and_unknown_identifiers(self) -> None:
+        with self.assertRaises(ValueError):
+            ADDON.cmd_get_python_api_docs({"identifier": "os.system"})
+        with self.assertRaises(ValueError):
+            ADDON.cmd_get_python_api_docs({"identifier": "bpy.types.NotARealType"})
+
+    # PropertyGroup field values live on the Scene datablock itself (that's
+    # what lets user settings survive a plain disable/enable in real usage),
+    # so they outlive register()/unregister() within one Blender session.
+    # Every test below must restore what it changes, rather than assume
+    # class defaults, so it doesn't leak state into whichever test runs next.
+
+    def test_register_and_unregister_manage_scene_settings_and_server_lifecycle(
+        self,
+    ) -> None:
+        ADDON._running = False
+        ADDON.register()
+        try:
+            settings = bpy.context.scene.blender_mcp_settings
+            self.assertFalse(settings.auto_start)
+            self.assertAlmostEqual(settings.poll_interval_active, 0.0, places=5)
+            self.assertAlmostEqual(settings.poll_interval_idle, 0.05, places=5)
+            self.assertFalse(ADDON._running)
+        finally:
+            ADDON.unregister()
+
+    def test_auto_start_handler_starts_server_and_is_idempotent(self) -> None:
+        ADDON._running = False
+        ADDON.register()
+        settings = bpy.context.scene.blender_mcp_settings
+        try:
+            settings.auto_start = True
+            settings.port = 19877
+            ADDON._auto_start_handler()
+            self.assertTrue(ADDON._running)
+            self.assertEqual(ADDON._bound_port, 19877)
+
+            # Calling again while already running must not re-bind or error.
+            ADDON._auto_start_handler()
+            self.assertTrue(ADDON._running)
+            self.assertEqual(ADDON._bound_port, 19877)
+        finally:
+            settings.auto_start = False
+            settings.port = 9876
+            ADDON.unregister()
+        self.assertFalse(ADDON._running)
+
+    def test_auto_start_handler_records_error_instead_of_raising(self) -> None:
+        ADDON._running = False
+        ADDON.register()
+        settings = bpy.context.scene.blender_mcp_settings
+        try:
+            settings.auto_start = True
+            original_socket_factory = ADDON.socket.socket
+
+            def denied_socket(*_args, **_kwargs):
+                raise PermissionError("listener creation denied")
+
+            ADDON.socket.socket = denied_socket
+            try:
+                ADDON._auto_start_handler()  # must not raise
+            finally:
+                ADDON.socket.socket = original_socket_factory
+            self.assertFalse(ADDON._running)
+            self.assertIn("Auto-start failed", ADDON._last_server_error or "")
+        finally:
+            settings.auto_start = False
+            ADDON.unregister()
+
+    def test_process_queue_uses_configured_poll_intervals(self) -> None:
+        ADDON.register()
+        settings = bpy.context.scene.blender_mcp_settings
+        try:
+            settings.poll_interval_active = 0.01
+            settings.poll_interval_idle = 0.25
+            self.assertEqual(ADDON._process_queue(), 0.25)
+        finally:
+            settings.poll_interval_active = 0.0
+            settings.poll_interval_idle = 0.05
+            ADDON.unregister()
+
 
 def main() -> None:
     print(f"Running Blender MCP add-on tests with Blender {bpy.app.version_string}")

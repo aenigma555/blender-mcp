@@ -31,6 +31,11 @@ Blender > Edit > Preferences > Add-ons > Install..., pick
 Open the 3D Viewport sidebar (`N`), go to the **MCP** tab, click
 **Start MCP Server**. It listens on `127.0.0.1:9876` by default.
 
+The same panel has an optional **Auto-start on load** toggle, which starts the
+server automatically when the add-on is enabled or a `.blend` file is opened
+(failures are non-blocking and shown in the panel instead), plus **active**/
+**idle poll interval** fields to trade command latency for idle CPU overhead.
+
 ### 2. Install the MCP server's dependencies
 
 ```bash
@@ -84,6 +89,16 @@ sun light, and render it."
 | `redo` | Redo the last N undone steps |
 | `execute_code` | Escape hatch: run arbitrary `bpy`/`bmesh` code (own `timeout` for long scripts) |
 | `save_file` | Save the `.blend` file (save-as with `filepath`, in place without) |
+| `get_objects_summary` | Scene's collection hierarchy (nested collections and their objects), unlike `get_scene_info`'s flat list |
+| `get_window_summary` | JSON description of window layout, areas, current mode, active object, and selection |
+| `jump_to_view3d_object` | Select an object, make it active, and frame it in the 3D viewport |
+| `render_thumbnail` | Fast, low-quality preview render (Workbench engine, no sample convergence); use `render_scene` for full quality |
+| `get_blendfile_summary_datablocks` | Data-block counts by type, active workspace, current render engine |
+| `get_blendfile_summary_missing_files` | External file references (images/libraries/fonts/sounds/movie clips/cache files) missing on disk |
+| `get_blendfile_summary_linked_libraries` | Tree of directly and indirectly linked library (`.blend`) files |
+| `get_blendfile_summary_path_info` | Current file's path, save status, size, time since save, local backup count |
+| `get_blendfile_summary_usage_guess` | Heuristic, scored guess at what the file is used for (rigging, geometry nodes, video editing, compositing, grease pencil, static asset) |
+| `get_python_api_docs` | Look up a `bpy` identifier's docstring/properties/functions at runtime; end with `*` after a dot to list matches (e.g. `bpy.types.Mesh*`) |
 
 `execute_code` is the escape hatch for anything not covered above —
 bmesh editing, modifiers, geometry nodes, UV unwrapping, etc. `bpy`,
@@ -133,17 +148,25 @@ blender --background --factory-startup --python-exit-code 1 \
 ```
 
 The Blender suite covers capsule topology, mirror/join normals, validation,
-request deduplication, stale server generations, and timer-safe exception
-handling.
+request deduplication, stale server generations, timer-safe exception
+handling, the blend-file summary/introspection tools, and the add-on's
+auto-start/poll-interval preferences. CI (`.github/workflows/ci.yml`) runs
+the server suite on every push/PR and the Blender suite against both the
+current Blender release and the 4.2 LTS series matching the add-on's
+declared minimum version.
 
 ## Notes
 
 - Each command has a unique request ID, and Blender returns a cached response
   when it receives the same ID and payload again. Cached responses are bounded
   and expire, so request IDs are not a permanent transaction log. The MCP
-  server automatically retries only `get_scene_info` and `get_object_info`
-  after sending; a sent mutation that loses its connection reports an unknown
-  outcome instead of risking a replay after cache eviction.
+  server automatically retries only pure read-only commands after sending
+  (`get_scene_info`, `get_object_info`, `get_objects_summary`,
+  `get_window_summary`, `get_python_api_docs`, and the
+  `get_blendfile_summary_*` tools); a sent mutation, or a command that writes
+  a file (`render_scene`, `render_thumbnail`, `get_viewport_screenshot`), that
+  loses its connection reports an unknown outcome instead of risking a replay
+  after cache eviction.
 - A timeout means the outcome is unknown, not that Blender cancelled the work.
   The MCP server closes the connection and does not retry a timed-out command,
   but Blender may still finish it. Inspect the scene before issuing another
@@ -152,8 +175,15 @@ handling.
   per port (change the port in the sidebar panel + `BLENDER_MCP_PORT`
   env var if you need more; `BLENDER_MCP_HOST` exists too but the add-on
   only listens on localhost).
-- Default render/screenshot paths live in the platform temp directory
-  (`tempfile.gettempdir()`), not a hardcoded `/tmp`.
+- Default render/screenshot/thumbnail paths live in the platform temp
+  directory (`tempfile.gettempdir()`), not a hardcoded `/tmp`.
+- `get_python_api_docs` introspects the running Blender's `bpy` module at
+  request time (docstrings, RNA property descriptions, operator signatures);
+  it doesn't bundle a copy of the Blender manual, so prose-level usage guides
+  aren't available through it — only what the API itself exposes.
+- `get_blendfile_summary_usage_guess` is a heuristic based on what kinds of
+  data-blocks are present (armatures, geometry-node groups, sequencer strips,
+  etc.), not a real classifier — treat it as a starting hint, not fact.
 - Localhost is the bridge's trust boundary, not an authentication mechanism.
   Any local process that can reach the port can invoke tools, and
   `execute_code` can run arbitrary Python with Blender/user permissions. Do

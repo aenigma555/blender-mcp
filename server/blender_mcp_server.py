@@ -22,16 +22,23 @@ BLENDER_HOST = os.environ.get("BLENDER_MCP_HOST", "127.0.0.1")
 BLENDER_PORT = int(os.environ.get("BLENDER_MCP_PORT", "9876"))
 DEFAULT_TIMEOUT = 120.0
 DEFAULT_RENDER_PATH = os.path.join(tempfile.gettempdir(), "blender_mcp_render.png")
+DEFAULT_THUMBNAIL_PATH = os.path.join(tempfile.gettempdir(), "blender_mcp_thumbnail.png")
 MAX_RESPONSE_BYTES = 64 * 1024 * 1024
 MAX_SCENE_INFO_LIMIT = 10_000
 MAX_RENDER_DIMENSION = 4096
 MAX_RENDER_PIXELS = MAX_RENDER_DIMENSION * MAX_RENDER_DIMENSION
 MAX_RENDER_SAMPLES = 4096
+MAX_THUMBNAIL_DIMENSION = 512
 MAX_TIMEOUT = 3600.0
 MAX_JOIN_OBJECTS = 256
 MAX_UNDO_STEPS = 100
 MAX_EXECUTE_CODE_BYTES = 8 * 1024 * 1024
-RETRY_SAFE_COMMANDS = frozenset({"get_scene_info", "get_object_info"})
+RETRY_SAFE_COMMANDS = frozenset({
+    "get_scene_info", "get_object_info", "get_objects_summary", "get_window_summary",
+    "get_blendfile_summary_datablocks", "get_blendfile_summary_missing_files",
+    "get_blendfile_summary_linked_libraries", "get_blendfile_summary_path_info",
+    "get_blendfile_summary_usage_guess", "get_python_api_docs",
+})
 
 mcp = FastMCP("blender")
 
@@ -542,6 +549,94 @@ def save_file(filepath: Optional[str] = None) -> dict:
             raise ValueError("filepath must not be empty")
         params["filepath"] = filepath
     return _conn.send_command("save_file", params)
+
+
+@mcp.tool()
+def get_objects_summary() -> dict:
+    """Get the scene's collection hierarchy (nested collections and the
+    objects directly in each one), unlike get_scene_info's flat object list."""
+    return _conn.send_command("get_objects_summary", {})
+
+
+@mcp.tool()
+def get_window_summary() -> dict:
+    """Get a JSON description of Blender's window layout: open windows,
+    their areas (type/position/size), current interaction mode, active
+    object, and selection."""
+    return _conn.send_command("get_window_summary", {})
+
+
+@mcp.tool()
+def jump_to_view3d_object(name: str) -> dict:
+    """Select the named object, make it active, and frame it in the 3D
+    viewport (like pressing Numpad-. after selecting it)."""
+    return _conn.send_command("jump_to_view3d_object", {"name": name})
+
+
+@mcp.tool()
+def render_thumbnail(
+    filepath: str = DEFAULT_THUMBNAIL_PATH,
+    size: int = 128,
+    timeout: float = 60,
+) -> Image:
+    """Render a small, fast preview of the current scene (Workbench engine,
+    no sample convergence) and return it as an image. For a full-quality
+    render use render_scene instead."""
+    size = _bounded_int(size, "size", minimum=1, maximum=MAX_THUMBNAIL_DIMENSION)
+    timeout = _finite_number(timeout, "timeout", minimum=1.0e-6, maximum=MAX_TIMEOUT)
+    result = _conn.send_command(
+        "render_thumbnail",
+        {"filepath": filepath, "size": size, "return_image": True},
+        timeout=timeout,
+    )
+    return _decode_png_result(result)
+
+
+@mcp.tool()
+def get_blendfile_summary_datablocks() -> dict:
+    """Get data-block counts by type (meshes, materials, images, etc.),
+    the active workspace, and the current render engine."""
+    return _conn.send_command("get_blendfile_summary_datablocks", {})
+
+
+@mcp.tool()
+def get_blendfile_summary_missing_files() -> dict:
+    """Find external file references (images, libraries, fonts, sounds,
+    movie clips, cache files) that point to a path missing on disk."""
+    return _conn.send_command("get_blendfile_summary_missing_files", {})
+
+
+@mcp.tool()
+def get_blendfile_summary_linked_libraries() -> dict:
+    """Get the tree of directly and indirectly linked library (.blend)
+    files this file depends on."""
+    return _conn.send_command("get_blendfile_summary_linked_libraries", {})
+
+
+@mcp.tool()
+def get_blendfile_summary_path_info() -> dict:
+    """Get the current file's path, save status, unsaved-changes flag, size,
+    time since last save, and local backup count."""
+    return _conn.send_command("get_blendfile_summary_path_info", {})
+
+
+@mcp.tool()
+def get_blendfile_summary_usage_guess() -> dict:
+    """Get a heuristic, scored guess at what this file is used for (character
+    rigging, procedural geometry nodes, video editing, compositing, 2D
+    grease-pencil animation, or a static look-dev asset) based on what kinds
+    of data it contains. Approximate - treat it as a starting hint, not fact."""
+    return _conn.send_command("get_blendfile_summary_usage_guess", {})
+
+
+@mcp.tool()
+def get_python_api_docs(identifier: str) -> dict:
+    """Look up a bpy Python API identifier at runtime (e.g.
+    'bpy.types.Object', 'bpy.types.Object.location', 'bpy.ops.mesh.primitive_cube_add').
+    Returns its docstring plus, for RNA types, its properties/functions. End
+    an identifier with '*' after a trailing dot to list matches, e.g.
+    'bpy.types.Mesh*' or 'bpy.ops.mesh.*'."""
+    return _conn.send_command("get_python_api_docs", {"identifier": identifier})
 
 
 if __name__ == "__main__":

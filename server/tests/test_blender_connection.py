@@ -420,6 +420,44 @@ class BlenderConnectionProtocolTests(unittest.TestCase):
         self.assertEqual(first_request["id"], retried_request["id"])
         self.assertEqual(first_request, retried_request)
 
+    def test_new_introspection_command_is_retry_safe(self):
+        # get_objects_summary is one of the newer read-only introspection
+        # tools; it must follow the same retry-after-close-on-read path as
+        # get_scene_info/get_object_info, driven by RETRY_SAFE_COMMANDS.
+        self.assertIn("get_objects_summary", server.RETRY_SAFE_COMMANDS)
+        closed_socket = ScriptedSocket(lambda _request: [b""])
+        fresh_socket = ScriptedSocket(
+            lambda request: [response_bytes(request, result={"scene_name": "Scene"})]
+        )
+        connection = server.BlenderConnection("127.0.0.1", 19876)
+        connection.sock = closed_socket
+
+        with mock.patch.object(server.socket, "socket", return_value=fresh_socket):
+            result = connection.send_command("get_objects_summary", {})
+
+        self.assertEqual(result, {"scene_name": "Scene"})
+        self.assertTrue(closed_socket.closed)
+        self.assertIs(connection.sock, fresh_socket)
+
+    def test_new_render_command_is_not_retry_safe(self):
+        # render_thumbnail writes a file as a side effect, like render_scene;
+        # it must never be silently replayed after losing its connection.
+        self.assertNotIn("render_thumbnail", server.RETRY_SAFE_COMMANDS)
+        closed_socket = ScriptedSocket(lambda _request: [b""])
+        connection = server.BlenderConnection("127.0.0.1", 19876)
+        connection.sock = closed_socket
+
+        with (
+            mock.patch.object(server.socket, "socket") as socket_factory,
+            self.assertRaises(ConnectionError) as raised,
+        ):
+            connection.send_command("render_thumbnail", {"size": 32})
+
+        message = str(raised.exception).lower()
+        self.assertIn("outcome", message)
+        self.assertIn("unknown", message)
+        socket_factory.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()
