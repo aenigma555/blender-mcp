@@ -46,7 +46,8 @@ class BlenderConnection:
                         raise ConnectionError("Blender closed the connection")
                     self.buf += chunk
                 line, self.buf = self.buf.split(b"\n", 1)
-            except (ConnectionError, OSError) as exc:
+                response = json.loads(line.decode("utf-8"))
+            except (ConnectionError, OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
                 if self.sock is not None:
                     self.sock.close()
                 self.sock = None
@@ -56,9 +57,12 @@ class BlenderConnection:
                     "Is the Blender MCP Bridge add-on running and its server started? "
                     f"({exc})"
                 ) from exc
-            response = json.loads(line.decode("utf-8"))
             if response.get("status") != "ok":
-                raise RuntimeError(response.get("error", "Unknown error from Blender"))
+                error = response.get("error", "Unknown error from Blender")
+                traceback_str = response.get("traceback")
+                if traceback_str:
+                    error = f"{error}\n\n{traceback_str}"
+                raise RuntimeError(error)
             return response.get("result", {})
 
 
@@ -212,6 +216,66 @@ def get_viewport_screenshot() -> Image:
     """Capture a screenshot of Blender's 3D viewport (fast, unlit, for quick feedback)."""
     result = _conn.send_command("get_viewport_screenshot", {})
     return Image(data=base64.b64decode(result["image_base64"]), format="png")
+
+
+@mcp.tool()
+def add_capsule(
+    start: tuple[float, float, float],
+    end: tuple[float, float, float],
+    radius: float = 0.1,
+    name: Optional[str] = None,
+    caps: bool = True,
+) -> dict:
+    """Add a cylinder (optionally with rounded sphere caps) aligned between two
+    world-space points. Use this for limbs/bones instead of hand-rotating a
+    cylinder with Euler angles - it handles the alignment math for you."""
+    params: dict[str, Any] = {
+        "start": list(start),
+        "end": list(end),
+        "radius": radius,
+        "caps": caps,
+    }
+    if name:
+        params["name"] = name
+    return _conn.send_command("add_capsule", params)
+
+
+@mcp.tool()
+def mirror_object(name: str, axis: str = "X", new_name: Optional[str] = None) -> dict:
+    """Duplicate an object and mirror it across the given local axis (X/Y/Z),
+    flipping normals so it renders correctly. Location is also mirrored about
+    world origin on that axis. Useful for generating the other half of a
+    symmetric part (e.g. mirror 'Arm_L' to get 'Arm_R')."""
+    params: dict[str, Any] = {"name": name, "axis": axis}
+    if new_name:
+        params["new_name"] = new_name
+    return _conn.send_command("mirror_object", params)
+
+
+@mcp.tool()
+def parent_object(child: str, parent: str, keep_transform: bool = True) -> dict:
+    """Parent one object to another. If keep_transform is True, the child's
+    current world-space position/rotation/scale is preserved."""
+    return _conn.send_command(
+        "parent_object", {"child": child, "parent": parent, "keep_transform": keep_transform}
+    )
+
+
+@mcp.tool()
+def join_objects(names: list[str], target_name: Optional[str] = None) -> dict:
+    """Join multiple mesh objects into one. The first name in the list becomes
+    the base object unless target_name is given to rename the result."""
+    params: dict[str, Any] = {"names": names}
+    if target_name:
+        params["target_name"] = target_name
+    return _conn.send_command("join_objects", params)
+
+
+@mcp.tool()
+def undo(steps: int = 1) -> dict:
+    """Undo the last N operations in Blender. Best-effort: stops early if
+    there is nothing left to undo."""
+    return _conn.send_command("undo", {"steps": steps})
 
 
 @mcp.tool()

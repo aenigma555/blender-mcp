@@ -15,15 +15,20 @@ import socket
 import threading
 import traceback
 
+import bmesh
 import bpy
+from mathutils import Matrix, Vector
 
 HOST = "127.0.0.1"
+MAX_LINE_BYTES = 64 * 1024 * 1024  # safety cap on a single buffered command line
 
 _server_socket = None
 _server_thread = None
 _running = False
 _command_queue = queue.Queue()
 _timer_registered = False
+_client_sockets_lock = threading.Lock()
+_client_sockets = set()
 
 
 # ---------------------------------------------------------------------------
@@ -222,6 +227,178 @@ def cmd_get_viewport_screenshot(params):
     raise RuntimeError("No VIEW_3D area found to screenshot")
 
 
+def _save_selection():
+    return {
+        "active": bpy.context.view_layer.objects.active,
+        "selected": list(bpy.context.selected_objects),
+    }
+
+
+def _restore_selection(state):
+    bpy.ops.object.select_all(action='DESELECT')
+    for obj in state["selected"]:
+        if obj and obj.name in bpy.data.objects:
+            obj.select_set(True)
+    active = state["active"]
+    if active and active.name in bpy.data.objects:
+        bpy.context.view_layer.objects.active = active
+
+
+def cmd_add_capsule(params):
+    start = Vector(params["start"])
+    end = Vector(params["end"])
+    radius = params.get("radius", 0.1)
+    if radius <= 0:
+        raise ValueError("radius must be positive")
+    name = params.get("name") or "Capsule"
+    caps = params.get("caps", True)
+
+    direction = end - start
+    length = direction.length
+    if length < 1e-6:
+        raise ValueError("start and end must differ")
+    d = direction.normalized()
+    center = (start + end) / 2
+
+    prev = _save_selection()
+    bpy.ops.mesh.primitive_cylinder_add(radius=radius, depth=length, location=center)
+    cyl = bpy.context.active_object
+    cyl.name = name
+    z = Vector((0, 0, 1))
+    cyl.rotation_mode = 'QUATERNION'
+    cyl.rotation_quaternion = z.rotation_difference(d)
+
+    if caps:
+        parts = [cyl]
+        try:
+            bpy.ops.mesh.primitive_uv_sphere_add(radius=radius, location=start)
+            cap_start = bpy.context.active_object
+            cap_start.name = f"{name}_cap_start"
+            parts.append(cap_start)
+
+            bpy.ops.mesh.primitive_uv_sphere_add(radius=radius, location=end)
+            cap_end = bpy.context.active_object
+            cap_end.name = f"{name}_cap_end"
+            parts.append(cap_end)
+
+            bpy.ops.object.select_all(action='DESELECT')
+            for p in parts:
+                p.select_set(True)
+            bpy.context.view_layer.objects.active = cyl
+            bpy.ops.object.join()
+            cyl.name = name
+        except Exception:
+            for p in parts:
+                if p.name in bpy.data.objects:
+                    bpy.data.objects.remove(p, do_unlink=True)
+            _restore_selection(prev)
+            raise
+
+    _restore_selection(prev)
+    return _obj_summary(cyl)
+
+
+def cmd_mirror_object(params):
+    name = params["name"]
+    obj = bpy.data.objects.get(name)
+    if obj is None:
+        raise ValueError(f"No object named '{name}'")
+    if obj.type != "MESH":
+        raise ValueError(f"Object '{name}' is type {obj.type}; mirror_object only supports MESH objects")
+    axis = params.get("axis", "X").upper()
+    axis_index = {"X": 0, "Y": 1, "Z": 2}.get(axis)
+    if axis_index is None:
+        raise ValueError(f"axis must be one of X, Y, Z, got '{axis}'")
+
+    new_obj = obj.copy()
+    new_obj.data = obj.data.copy()
+    new_obj.name = params.get("new_name") or f"{name}_mirror"
+    bpy.context.collection.objects.link(new_obj)
+
+    try:
+        location = list(new_obj.location)
+        location[axis_index] = -location[axis_index]
+        new_obj.location = location
+
+        scale_vec = [1.0, 1.0, 1.0]
+        scale_vec[axis_index] = -1.0
+        new_obj.data.transform(Matrix.Diagonal((*scale_vec, 1.0)))
+
+        bm = bmesh.new()
+        try:
+            bm.from_mesh(new_obj.data)
+            for f in bm.faces:
+                f.normal_flip()
+            bm.normal_update()
+            bm.to_mesh(new_obj.data)
+        finally:
+            bm.free()
+        new_obj.data.update()
+    except Exception:
+        mesh_data = new_obj.data
+        bpy.data.objects.remove(new_obj, do_unlink=True)
+        if mesh_data.users == 0:
+            bpy.data.meshes.remove(mesh_data)
+        raise
+
+    return _obj_summary(new_obj)
+
+
+def cmd_parent_object(params):
+    child = bpy.data.objects.get(params["child"])
+    if child is None:
+        raise ValueError(f"No object named '{params['child']}'")
+    parent = bpy.data.objects.get(params["parent"])
+    if parent is None:
+        raise ValueError(f"No object named '{params['parent']}'")
+    child.parent = parent
+    if params.get("keep_transform", True):
+        child.matrix_parent_inverse = parent.matrix_world.inverted()
+    else:
+        child.matrix_parent_inverse.identity()
+    return {"child": child.name, "parent": parent.name}
+
+
+def cmd_join_objects(params):
+    names = params["names"]
+    objs = []
+    for n in names:
+        obj = bpy.data.objects.get(n)
+        if obj is None:
+            raise ValueError(f"No object named '{n}'")
+        if obj.type != "MESH":
+            raise ValueError(f"Object '{n}' is type {obj.type}; join_objects only supports MESH objects")
+        objs.append(obj)
+    if len(objs) < 2:
+        raise ValueError("Need at least 2 objects to join")
+    bpy.ops.object.select_all(action='DESELECT')
+    for o in objs:
+        o.select_set(True)
+    bpy.context.view_layer.objects.active = objs[0]
+    bpy.ops.object.join()
+    joined = bpy.context.active_object
+    target_name = params.get("target_name")
+    if target_name:
+        joined.name = target_name
+    return _obj_summary(joined)
+
+
+def cmd_undo(params):
+    steps = params.get("steps", 1)
+    if not isinstance(steps, int) or steps < 1:
+        raise ValueError("steps must be a positive integer")
+    performed = 0
+    for _ in range(steps):
+        try:
+            result = bpy.ops.ed.undo()
+        except RuntimeError:
+            break
+        if 'FINISHED' not in result:
+            break
+        performed += 1
+    return {"steps_requested": steps, "steps_performed": performed}
+
+
 def cmd_execute_code(params):
     code = params["code"]
     local_ns = {"bpy": bpy}
@@ -248,6 +425,11 @@ _HANDLERS = {
     "set_camera": cmd_set_camera,
     "render_scene": cmd_render_scene,
     "get_viewport_screenshot": cmd_get_viewport_screenshot,
+    "add_capsule": cmd_add_capsule,
+    "mirror_object": cmd_mirror_object,
+    "parent_object": cmd_parent_object,
+    "join_objects": cmd_join_objects,
+    "undo": cmd_undo,
     "execute_code": cmd_execute_code,
     "save_file": cmd_save_file,
 }
@@ -281,38 +463,72 @@ def _process_queue():
     return 0.05  # reschedule
 
 
+def _send_response(conn, response):
+    try:
+        payload = json.dumps(response)
+    except (TypeError, ValueError) as exc:
+        payload = json.dumps({"status": "error", "error": f"Result not JSON-serializable: {exc}"})
+    conn.sendall((payload + "\n").encode("utf-8"))
+
+
 def _handle_client(conn):
+    with _client_sockets_lock:
+        _client_sockets.add(conn)
     buf = b""
     try:
         while _running:
-            chunk = conn.recv(65536)
+            try:
+                chunk = conn.recv(65536)
+            except OSError:
+                break
             if not chunk:
                 break
             buf += chunk
+            if len(buf) > MAX_LINE_BYTES:
+                try:
+                    _send_response(conn, {"status": "error", "error": "Command exceeds max size"})
+                except OSError:
+                    pass
+                break
             while b"\n" in buf:
                 line, buf = buf.split(b"\n", 1)
                 if not line.strip():
                     continue
                 try:
                     command = json.loads(line.decode("utf-8"))
-                except json.JSONDecodeError as exc:
-                    conn.sendall((json.dumps({"status": "error", "error": f"bad json: {exc}"}) + "\n").encode("utf-8"))
+                except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+                    try:
+                        _send_response(conn, {"status": "error", "error": f"bad json: {exc}"})
+                    except OSError:
+                        pass
                     continue
                 response_box = queue.Queue()
                 _command_queue.put((command, response_box))
-                response = response_box.get()
-                conn.sendall((json.dumps(response) + "\n").encode("utf-8"))
+                response = None
+                while _running:
+                    try:
+                        response = response_box.get(timeout=0.5)
+                        break
+                    except queue.Empty:
+                        continue
+                if response is None:
+                    response = {"status": "error", "error": "Server is stopping"}
+                try:
+                    _send_response(conn, response)
+                except OSError:
+                    break
     except (ConnectionResetError, OSError):
         pass
     finally:
+        with _client_sockets_lock:
+            _client_sockets.discard(conn)
         conn.close()
 
 
-def _accept_loop():
-    global _server_socket
+def _accept_loop(sock):
     while _running:
         try:
-            conn, _addr = _server_socket.accept()
+            conn, _addr = sock.accept()
         except OSError:
             break
         threading.Thread(target=_handle_client, args=(conn,), daemon=True).start()
@@ -322,12 +538,17 @@ def start_server(port):
     global _server_socket, _server_thread, _running, _timer_registered
     if _running:
         return
-    _server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    _server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    _server_socket.bind((HOST, port))
-    _server_socket.listen(5)
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    try:
+        sock.bind((HOST, port))
+    except OSError as exc:
+        sock.close()
+        raise RuntimeError(f"Could not bind to {HOST}:{port} ({exc})") from exc
+    sock.listen(5)
+    _server_socket = sock
     _running = True
-    _server_thread = threading.Thread(target=_accept_loop, daemon=True)
+    _server_thread = threading.Thread(target=_accept_loop, args=(sock,), daemon=True)
     _server_thread.start()
     if not _timer_registered:
         bpy.app.timers.register(_process_queue, persistent=True)
@@ -343,6 +564,14 @@ def stop_server():
         except OSError:
             pass
         _server_socket = None
+    with _client_sockets_lock:
+        stale_sockets = list(_client_sockets)
+        _client_sockets.clear()
+    for sock in stale_sockets:
+        try:
+            sock.close()
+        except OSError:
+            pass
     if _timer_registered:
         if bpy.app.timers.is_registered(_process_queue):
             bpy.app.timers.unregister(_process_queue)
@@ -364,7 +593,12 @@ class MCP_OT_start(bpy.types.Operator):
 
     def execute(self, context):
         settings = context.scene.blender_mcp_settings
-        start_server(settings.port)
+        try:
+            start_server(settings.port)
+        except RuntimeError as exc:
+            settings.running = False
+            self.report({"ERROR"}, str(exc))
+            return {"CANCELLED"}
         settings.running = True
         self.report({"INFO"}, f"MCP server listening on {HOST}:{settings.port}")
         return {"FINISHED"}
