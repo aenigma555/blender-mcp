@@ -51,8 +51,14 @@ Open the 3D Viewport sidebar (`N`), go to the **MCP** tab, click
 
 The same panel has an optional **Auto-start on load** toggle, which starts the
 server automatically when the add-on is enabled or a `.blend` file is opened
-(failures are non-blocking and shown in the panel instead), plus **active**/
-**idle poll interval** fields to trade command latency for idle CPU overhead.
+(failures are non-blocking and shown in the panel instead; this also requires
+Blender's system-level **Allow Online Access** preference to be enabled,
+Preferences > System > Network). **Active**/**idle poll interval** fields
+trade command latency for idle CPU overhead, and **idle delay** keeps polling
+at the active rate for a few seconds after the queue empties, so a quick
+follow-up call right after a burst doesn't pay the idle interval's latency.
+**Log requests** prints every tool request and response status to the system
+console, for debugging.
 
 ### 2. Install the MCP server's dependencies
 
@@ -107,9 +113,9 @@ sun light, and render it."
 | `redo` | Redo the last N undone steps |
 | `execute_code` | Escape hatch: run arbitrary `bpy`/`bmesh` code (own `timeout` for long scripts); captures `print()` output as `stdout`/`stderr`; blocks a few destructive calls and `sys.exit()` as a guardrail |
 | `save_file` | Save the `.blend` file (save-as with `filepath`, in place without) |
-| `get_objects_summary` | Scene's collection hierarchy (nested collections and their objects), unlike `get_scene_info`'s flat list |
+| `get_objects_summary` | Scene's collection hierarchy (nested collections, each with its direct objects' name/type/parent/data-block name/selection/visibility), unlike `get_scene_info`'s flat list |
 | `get_window_summary` | JSON description of window layout, areas, current mode, active object, and selection |
-| `jump_to_view3d_object` | Select an object, make it active, and frame it in the 3D viewport |
+| `jump_to_view3d_object` | Select an object, make it active, and frame it in the 3D viewport; `allow_edits` un-hides it and enables its collection first if needed |
 | `render_thumbnail` | Fast, low-quality preview render (Workbench engine, no sample convergence); use `render_scene` for full quality |
 | `get_blendfile_summary_datablocks` | Data-block counts by type, active workspace, current render engine |
 | `get_blendfile_summary_missing_files` | External file references (images/libraries/fonts/sounds/movie clips/cache files) missing on disk |
@@ -124,11 +130,11 @@ sun light, and render it."
 | `get_blendfile_summary_usage_guess_for_cli` | Same as `get_blendfile_summary_usage_guess`, background/CLI mode |
 | `execute_code_for_cli` | Same as `execute_code`, but runs unattended against `blend_file` in a background process; does **not** save automatically |
 | `render_viewport_to_path` | Render using whatever engine/resolution/samples the scene already has configured, without overriding them — unlike `render_scene`/`render_thumbnail` |
-| `get_screenshot_of_area_as_image` | Screenshot of one editor area by type (`VIEW_3D`, `NODE_EDITOR`, `PROPERTIES`, etc.), not just the 3D viewport |
-| `get_screenshot_of_window_as_image` | Screenshot of the entire window — every visible area combined |
-| `jump_to_view3d_object_data` | Select and frame the object using a given data-block name (mesh/curve/etc.), instead of an object name |
+| `get_screenshot_of_area_as_image` | Screenshot of one editor area by its `area_ui_type` (`VIEW_3D`, `PROPERTIES`, `ShaderNodeTree`, `CompositorNodeTree`, `GeometryNodeTree`, etc. — more precise than the broad area type, since e.g. all three node-tree editors share one), not just the 3D viewport; `size_limit_in_bytes` downscales the image to fit instead of failing |
+| `get_screenshot_of_window_as_image` | Screenshot of the entire window — every visible area combined; also takes `size_limit_in_bytes` |
+| `jump_to_view3d_object_data` | Select and frame the object using a given data-block name (mesh/curve/etc.), instead of an object name; same `allow_edits` as `jump_to_view3d_object` |
 | `jump_to_tab_by_name` | Switch every open window's active workspace tab by name (e.g. `Shading`, `Scripting`) |
-| `jump_to_tab_by_space_type` | Switch to whichever workspace has an area of a given editor type (e.g. `NODE_EDITOR`) |
+| `jump_to_tab_by_space_type` | Switch to whichever workspace has an area of a given editor type (e.g. `NODE_EDITOR`); `allow_edits` creates one (by duplicating the current workspace) if none matches |
 
 `execute_code` is the escape hatch for anything not covered above —
 bmesh editing, modifiers, geometry nodes, UV unwrapping, etc. `bpy`,
@@ -206,6 +212,17 @@ declared minimum version.
 
 ## Notes
 
+- The MCP server advertises a bundled field guide (via FastMCP's
+  `instructions`) covering common Blender scripting gotchas — rotation
+  modes, active-object-vs-selection, bmesh flush-back, dependency-graph
+  staleness, shared data-blocks, and the three independent visibility
+  states — plus this bridge's own retry/undo/CLI-mode semantics. See
+  `SERVER_INSTRUCTIONS` in `server/blender_mcp_server.py`.
+- Starting the server (manually or via auto-start) requires Blender's
+  system-level **Allow Online Access** preference to be enabled; if it
+  isn't, `start_server` refuses with a clear error rather than silently
+  opening a socket anyway. Whether binding to localhost really counts as
+  "online" is a grey area, but this errs conservative.
 - Each command has a unique request ID, and Blender returns a cached response
   when it receives the same ID and payload again. Cached responses are bounded
   and expire, so request IDs are not a permanent transaction log. The MCP

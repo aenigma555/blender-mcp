@@ -458,6 +458,11 @@ class BlenderConnectionProtocolTests(unittest.TestCase):
         self.assertIn("unknown", message)
         socket_factory.assert_not_called()
 
+    def test_server_exposes_field_guide_instructions(self):
+        self.assertEqual(server.mcp.instructions, server.SERVER_INSTRUCTIONS)
+        self.assertIn("rotation_mode", server.SERVER_INSTRUCTIONS)
+        self.assertIn("_for_cli", server.SERVER_INSTRUCTIONS)
+
 
 if __name__ == "__main__":
     unittest.main()

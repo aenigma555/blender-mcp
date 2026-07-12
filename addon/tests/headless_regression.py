@@ -14,6 +14,7 @@ from __future__ import annotations
 import base64
 from collections import OrderedDict
 import importlib.util
+import io
 import json
 import math
 import os
@@ -123,6 +124,8 @@ class BlenderMCPHeadlessTests(unittest.TestCase):
             "_timer_registered": ADDON._timer_registered,
             "_last_server_error": ADDON._last_server_error,
             "_client_sockets": ADDON._client_sockets,
+            "_online_access_allowed": ADDON._online_access_allowed,
+            "_idle_countdown": ADDON._idle_countdown,
         }
         ADDON._command_queue = queue.Queue(maxsize=ADDON.MAX_PENDING_COMMANDS)
         ADDON._response_cache = OrderedDict()
@@ -137,6 +140,11 @@ class BlenderMCPHeadlessTests(unittest.TestCase):
         ADDON._timer_registered = False
         ADDON._last_server_error = None
         ADDON._client_sockets = {}
+        ADDON._idle_countdown = 0
+        # --factory-startup defaults bpy.app.online_access to False, which
+        # would otherwise fail every test that calls the real start_server();
+        # only test_online_access_blocks_start_server exercises that path.
+        ADDON._online_access_allowed = lambda: True
 
     def tearDown(self) -> None:
         # A test may temporarily replace the add-on's bpy reference.
@@ -503,6 +511,22 @@ class BlenderMCPHeadlessTests(unittest.TestCase):
         self.assertIsNone(ADDON._last_server_error)
         self.assertEqual(ADDON._client_sockets, {})
 
+    def test_online_access_blocks_start_server(self) -> None:
+        ADDON._running = False
+        ADDON._online_access_allowed = lambda: False
+        with self.assertRaisesRegex(RuntimeError, "[Oo]nline access"):
+            ADDON.start_server(19876)
+        self.assertFalse(ADDON._running)
+        self.assertIsNone(ADDON._server_socket)
+
+        # And it must not have bound a socket that could leak/conflict.
+        ADDON._online_access_allowed = lambda: True
+        ADDON.start_server(19876)
+        try:
+            self.assertTrue(ADDON._running)
+        finally:
+            ADDON.stop_server()
+
     def test_old_generation_cleanup_preserves_new_generation_client(self) -> None:
         class TrackedSocket:
             def __init__(self, label):
@@ -615,8 +639,10 @@ class BlenderMCPHeadlessTests(unittest.TestCase):
         self.assertEqual(first["id"], "same-request")
         self.assertEqual(first["status"], "ok")
         self.assertEqual(first["result"]["execution_count"], 1)
-        self.assertEqual(first_interval, 0.05)
-        self.assertEqual(replayed_interval, 0.05)
+        # Each tick processed one command, so it stays at the active rate
+        # (0.0 by default) rather than dropping straight to idle.
+        self.assertEqual(first_interval, 0.0)
+        self.assertEqual(replayed_interval, 0.0)
         self.assertEqual(len(ADDON._response_cache), 1)
         self.assertGreater(ADDON._response_cache_bytes, 0)
 
@@ -672,7 +698,8 @@ class BlenderMCPHeadlessTests(unittest.TestCase):
         self.assertEqual(response["id"], "stale-request")
         self.assertEqual(response["status"], "error")
         self.assertIn("generation", response["error"].lower())
-        self.assertEqual(interval, 0.05)
+        # Still counts as a tick that did work, even though it was rejected.
+        self.assertEqual(interval, 0.0)
         self.assertEqual(len(ADDON._response_cache), 0)
         self.assertEqual(ADDON._response_cache_bytes, 0)
 
@@ -699,8 +726,8 @@ class BlenderMCPHeadlessTests(unittest.TestCase):
         self.assertIn("scripted interrupt", response["error"])
         self.assertIn("KeyboardInterrupt", response["traceback"])
         self.assertEqual(replayed, response)
-        self.assertEqual(interval, 0.05)
-        self.assertEqual(replayed_interval, 0.05)
+        self.assertEqual(interval, 0.0)
+        self.assertEqual(replayed_interval, 0.0)
 
     def test_process_queue_contains_exception_with_hostile_string_conversion(self) -> None:
         class HostileBaseException(BaseException):
@@ -727,7 +754,7 @@ class BlenderMCPHeadlessTests(unittest.TestCase):
         self.assertEqual(response["status"], "error")
         self.assertIsInstance(response["error"], str)
         self.assertTrue(response["error"])
-        self.assertEqual(interval, 0.05)
+        self.assertEqual(interval, 0.0)
 
     def test_mutating_queue_command_pushes_one_undo_boundary_and_replay_pushes_none(self) -> None:
         handler_calls = []
@@ -850,14 +877,25 @@ class BlenderMCPHeadlessTests(unittest.TestCase):
     def test_get_objects_summary_reports_collection_hierarchy(self) -> None:
         child = bpy.data.collections.new("ChildCollection")
         bpy.context.scene.collection.children.link(child)
-        obj = bpy.data.objects.new("HierarchyObject", None)
+        bpy.ops.mesh.primitive_cube_add()
+        obj = bpy.context.active_object
+        for existing_collection in list(obj.users_collection):
+            existing_collection.objects.unlink(obj)
         child.objects.link(obj)
+        obj.select_set(True)
 
         summary = ADDON.cmd_get_objects_summary({})
         top = summary["collection"]
         self.assertEqual(top["name"], bpy.context.scene.collection.name)
         nested = next(c for c in top["children"] if c["name"] == "ChildCollection")
-        self.assertEqual(nested["objects"], ["HierarchyObject"])
+        self.assertEqual(len(nested["objects"]), 1)
+        obj_summary = nested["objects"][0]
+        self.assertEqual(obj_summary["name"], obj.name)
+        self.assertEqual(obj_summary["type"], "MESH")
+        self.assertIsNone(obj_summary["parent"])
+        self.assertEqual(obj_summary["data_name"], obj.data.name)
+        self.assertTrue(obj_summary["selected"])
+        self.assertTrue(obj_summary["visible"])
 
     def test_get_window_summary_reports_mode_and_selection(self) -> None:
         obj = bpy.data.objects.new("SelectedObject", None)
@@ -901,6 +939,56 @@ class BlenderMCPHeadlessTests(unittest.TestCase):
         self.assertTrue(cube.select_get())
         self.assertIs(bpy.context.view_layer.objects.active, cube)
 
+    def test_jump_to_view3d_object_requires_allow_edits_to_unhide(self) -> None:
+        bpy.ops.mesh.primitive_cube_add()
+        obj = bpy.context.active_object
+        obj.hide_set(True)
+
+        with self.assertRaisesRegex(RuntimeError, "allow_edits"):
+            ADDON.cmd_jump_to_view3d_object({"name": obj.name})
+        self.assertFalse(obj.select_get())
+
+        result = ADDON.cmd_jump_to_view3d_object({"name": obj.name, "allow_edits": True})
+        self.assertEqual(result, {"focused": obj.name})
+        self.assertFalse(obj.hide_get())
+        self.assertTrue(obj.select_get())
+
+    def test_jump_to_view3d_object_requires_allow_edits_to_enable_collection(self) -> None:
+        bpy.ops.mesh.primitive_cube_add()
+        obj = bpy.context.active_object
+        for collection in list(obj.users_collection):
+            collection.objects.unlink(obj)
+        excluded = bpy.data.collections.new("ExcludedCollection")
+        bpy.context.scene.collection.children.link(excluded)
+        excluded.objects.link(obj)
+        layer_collection = next(
+            lc for lc in bpy.context.view_layer.layer_collection.children
+            if lc.name == excluded.name
+        )
+        layer_collection.exclude = True
+
+        with self.assertRaisesRegex(RuntimeError, "allow_edits"):
+            ADDON.cmd_jump_to_view3d_object({"name": obj.name})
+
+        result = ADDON.cmd_jump_to_view3d_object({"name": obj.name, "allow_edits": True})
+        self.assertEqual(result, {"focused": obj.name})
+        self.assertFalse(layer_collection.exclude)
+        self.assertTrue(obj.select_get())
+
+    def test_jump_to_view3d_object_data_passes_through_allow_edits(self) -> None:
+        bpy.ops.mesh.primitive_cube_add()
+        obj = bpy.context.active_object
+        obj.hide_set(True)
+
+        with self.assertRaisesRegex(RuntimeError, "allow_edits"):
+            ADDON.cmd_jump_to_view3d_object_data({"name": obj.data.name})
+
+        result = ADDON.cmd_jump_to_view3d_object_data(
+            {"name": obj.data.name, "allow_edits": True}
+        )
+        self.assertEqual(result, {"focused": obj.name, "data_name": obj.data.name})
+        self.assertFalse(obj.hide_get())
+
     def test_jump_to_tab_by_name_identifies_workspace_and_rejects_unknown(self) -> None:
         # Window.workspace assignment is real but Blender only applies it on
         # its next window-manager event tick (confirmed manually: a deferred
@@ -932,11 +1020,88 @@ class BlenderMCPHeadlessTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             ADDON.cmd_jump_to_tab_by_space_type({"space_type": "NOT_A_REAL_SPACE_TYPE"})
 
+    def test_jump_to_tab_by_space_type_creates_workspace_when_allow_edits(self) -> None:
+        # No default workspace has a PREFERENCES area.
+        with self.assertRaises(ValueError):
+            ADDON.cmd_jump_to_tab_by_space_type({"space_type": "PREFERENCES"})
+
+        before_names = {w.name for w in bpy.data.workspaces}
+        result = ADDON.cmd_jump_to_tab_by_space_type(
+            {"space_type": "PREFERENCES", "allow_edits": True}
+        )
+        after_names = {w.name for w in bpy.data.workspaces}
+        self.assertEqual(len(after_names - before_names), 1)
+        new_workspace = bpy.data.workspaces[result["workspace"]]
+        self.assertIn(
+            "PREFERENCES",
+            [area.type for screen in new_workspace.screens for area in screen.areas],
+        )
+
+        # A second call must reuse the workspace just created, not duplicate again.
+        result2 = ADDON.cmd_jump_to_tab_by_space_type(
+            {"space_type": "PREFERENCES", "allow_edits": True}
+        )
+        self.assertEqual(result2["workspace"], result["workspace"])
+        self.assertEqual({w.name for w in bpy.data.workspaces}, after_names)
+
     def test_get_screenshot_of_area_rejects_unknown_area_type_before_capturing(self) -> None:
         # This path never reaches the real screenshot operator (which needs a
         # display background mode doesn't have), so it's safe to test headless.
         with self.assertRaises(RuntimeError):
-            ADDON.cmd_get_screenshot_of_area({"area_type": "NOT_A_REAL_AREA_TYPE"})
+            ADDON.cmd_get_screenshot_of_area({"area_ui_type": "NOT_A_REAL_UI_TYPE"})
+
+    def test_get_screenshot_of_area_matches_ui_type_not_broad_area_type(self) -> None:
+        # DOPESHEET_EDITOR areas can show either the full Dopesheet
+        # (ui_type=DOPESHEET_EDITOR) or the compact Timeline (ui_type=
+        # TIMELINE) - both share area.type == 'DOPESHEET_EDITOR', so
+        # matching on ui_type is required to tell them apart. Regardless of
+        # which sub-mode the default file's dopesheet area is in, at least
+        # one of the two must be absent, and asking for it must not fall
+        # back to matching the other by its broader area.type.
+        area_ui_types_present = {
+            area.ui_type
+            for window in bpy.context.window_manager.windows
+            for area in window.screen.areas
+        }
+        missing = {"DOPESHEET_EDITOR", "TIMELINE"} - area_ui_types_present
+        self.assertTrue(missing, "test file needs a dopesheet-family area for this check")
+        with self.assertRaises(RuntimeError):
+            ADDON.cmd_get_screenshot_of_area({"area_ui_type": next(iter(missing))})
+
+    def test_downscale_image_to_size_limit_shrinks_a_real_png(self) -> None:
+        # A real render (not a screenshot) works fine in --background mode
+        # and is a genuine PNG file for the imbuf-based downscale to work on.
+        bpy.ops.object.camera_add(location=(5, -5, 5), rotation=(1.1, 0, 0.78))
+        bpy.context.scene.camera = bpy.context.active_object
+        render = bpy.context.scene.render
+        original_resolution = (render.resolution_x, render.resolution_y)
+        render.resolution_x = 400
+        render.resolution_y = 400
+        output_path = os.path.join(
+            tempfile.gettempdir(), f"mcp_test_downscale_{uuid.uuid4().hex}.png"
+        )
+        render.filepath = output_path
+        render.image_settings.file_format = "PNG"
+        try:
+            bpy.ops.render.render(write_still=True)
+            full_size = os.path.getsize(output_path)
+
+            # A no-op when the file already fits or the limit is disabled (0).
+            ADDON._downscale_image_to_size_limit(output_path, 0)
+            self.assertEqual(os.path.getsize(output_path), full_size)
+            ADDON._downscale_image_to_size_limit(output_path, full_size * 10)
+            self.assertEqual(os.path.getsize(output_path), full_size)
+
+            tiny_limit = 5000
+            ADDON._downscale_image_to_size_limit(output_path, tiny_limit)
+            downscaled_size = os.path.getsize(output_path)
+            self.assertLess(downscaled_size, full_size)
+        finally:
+            render.resolution_x, render.resolution_y = original_resolution
+            try:
+                os.remove(output_path)
+            except OSError:
+                pass
 
     def test_render_viewport_requires_camera(self) -> None:
         # No active camera, same as the render_scene/render_thumbnail
@@ -1194,6 +1359,35 @@ class BlenderMCPHeadlessTests(unittest.TestCase):
         })
         self.assertGreater(result["result"], 0)
 
+    def test_execute_code_failure_raises_with_captured_output_attached(self) -> None:
+        with self.assertRaises(ADDON._CapturedOutputError) as ctx:
+            ADDON.cmd_execute_code({
+                "code": "print('before failure')\nraise RuntimeError('boom')",
+            })
+        self.assertIn("boom", str(ctx.exception))
+        self.assertEqual(ctx.exception.stdout, "before failure\n")
+        self.assertEqual(ctx.exception.stderr, "")
+
+    def test_execute_code_failure_still_returns_captured_output_via_queue(self) -> None:
+        # End-to-end through _execute_queued_command's generic error path,
+        # not just cmd_execute_code's own raised exception.
+        real_handlers = self._protocol_globals["_HANDLERS"]
+        emptied_handlers = ADDON._HANDLERS
+        ADDON._HANDLERS = real_handlers
+        try:
+            command = {
+                "id": "print-then-fail",
+                "type": "execute_code",
+                "params": {"code": "print('before failure')\nraise RuntimeError('boom')"},
+            }
+            response, _interval = self.process_queued_command(command)
+        finally:
+            ADDON._HANDLERS = emptied_handlers
+        self.assertEqual(response["status"], "error")
+        self.assertIn("boom", response["error"])
+        self.assertEqual(response["stdout"], "before failure\n")
+        self.assertNotIn("stderr", response)
+
     def test_process_queue_uses_configured_poll_intervals(self) -> None:
         ADDON.register()
         settings = bpy.context.scene.blender_mcp_settings
@@ -1205,6 +1399,78 @@ class BlenderMCPHeadlessTests(unittest.TestCase):
             settings.poll_interval_active = 0.0
             settings.poll_interval_idle = 0.05
             ADDON.unregister()
+
+    def test_process_queue_stays_active_for_idle_delay_after_a_burst(self) -> None:
+        ADDON.register()
+        settings = bpy.context.scene.blender_mcp_settings
+        real_handlers = self._protocol_globals["_HANDLERS"]
+        emptied_handlers = ADDON._HANDLERS
+        try:
+            settings.poll_interval_active = 0.01
+            settings.poll_interval_idle = 0.25
+            settings.poll_interval_idle_delay = 0.03  # ceil(0.03 / 0.01) = 3 ticks
+            ADDON._HANDLERS = real_handlers
+
+            # One processed command seeds the idle countdown.
+            self.process_queued_command(
+                {"id": "seed", "type": "get_scene_info", "params": {}}
+            )
+
+            # The next 3 empty-queue ticks must still be at the active rate...
+            for tick in range(3):
+                with self.subTest(tick=tick):
+                    self.assertAlmostEqual(ADDON._process_queue(), 0.01, places=5)
+            # ...and only then drop to idle.
+            self.assertAlmostEqual(ADDON._process_queue(), 0.25, places=5)
+            self.assertAlmostEqual(ADDON._process_queue(), 0.25, places=5)
+        finally:
+            ADDON._HANDLERS = emptied_handlers
+            settings.poll_interval_active = 0.0
+            settings.poll_interval_idle = 0.05
+            settings.poll_interval_idle_delay = 5.0
+            ADDON.unregister()
+
+    def test_use_log_prints_request_and_response_when_enabled(self) -> None:
+        ADDON.register()
+        settings = bpy.context.scene.blender_mcp_settings
+        real_handlers = self._protocol_globals["_HANDLERS"]
+        emptied_handlers = ADDON._HANDLERS
+        captured = io.StringIO()
+        original_stderr = sys.stderr
+        try:
+            settings.use_log = True
+            ADDON._HANDLERS = real_handlers
+            sys.stderr = captured
+            command = {
+                "id": "log-test",
+                "type": "get_scene_info",
+                "params": {},
+            }
+            self.process_queued_command(command)
+        finally:
+            sys.stderr = original_stderr
+            ADDON._HANDLERS = emptied_handlers
+            settings.use_log = False
+            ADDON.unregister()
+
+        output = captured.getvalue()
+        self.assertIn("request: get_scene_info", output)
+        self.assertIn("response: ok", output)
+
+    def test_use_log_disabled_by_default_prints_nothing(self) -> None:
+        real_handlers = self._protocol_globals["_HANDLERS"]
+        emptied_handlers = ADDON._HANDLERS
+        captured = io.StringIO()
+        original_stderr = sys.stderr
+        try:
+            ADDON._HANDLERS = real_handlers
+            sys.stderr = captured
+            command = {"id": "no-log-test", "type": "get_scene_info", "params": {}}
+            self.process_queued_command(command)
+        finally:
+            sys.stderr = original_stderr
+            ADDON._HANDLERS = emptied_handlers
+        self.assertEqual(captured.getvalue(), "")
 
 
 def main() -> None:

@@ -49,7 +49,57 @@ RETRY_SAFE_COMMANDS = frozenset({
     "get_blendfile_summary_usage_guess", "get_python_api_docs",
 })
 
-mcp = FastMCP("blender")
+SERVER_INSTRUCTIONS = """\
+This connects to a live, running Blender instance. Prefer the specific
+tools below over execute_code where one exists - they already handle
+Blender's sharp edges (rotation modes, undo boundaries, etc.) for you.
+
+## Common execute_code gotchas
+
+- Rotation mode: writing `obj.rotation_euler` is silently ignored if
+  `obj.rotation_mode` is 'QUATERNION' or 'AXIS_ANGLE' (set_transform
+  already handles this for you; in execute_code, check/set rotation_mode
+  explicitly first).
+- Active object and selection are independent, and bpy.ops operators
+  change both as a side effect - re-set them explicitly between
+  sequential operator calls on different objects, don't assume the
+  previous call's state carried over.
+- In Edit Mode, read/write mesh geometry through bmesh, not the mesh data
+  API directly, and flush changes back with bm.to_mesh(mesh) +
+  mesh.update() - forgetting this silently discards the edits.
+- World-space matrices and modifier results can be stale until
+  bpy.context.view_layer.update() runs (or the depsgraph is otherwise
+  evaluated) after a change.
+- An object's transform/mesh/etc. and its underlying data-block (mesh,
+  curve, camera...) are separate; multiple objects can share one
+  data-block. Check its user count before editing it in place, or every
+  object using it changes at once.
+- Objects created via bpy.data (not bpy.ops) must be linked into a
+  collection to actually appear in the scene.
+- Visibility has three independent states that can each hide an object
+  for a different reason: viewport-hidden (hide_get/hide_set), excluded
+  from the view layer (layer_collection.exclude), and render-disabled
+  (hide_render).
+
+## This bridge's specific behavior
+
+- Mutating tool calls are never automatically retried after a connection
+  failure - a lost connection means the outcome is unknown, not failed.
+  Read-only tools (get_scene_info, get_blendfile_summary_*, etc.) do
+  retry once.
+- undo() maps to Blender's real undo stack. Most tools push exactly one
+  step, but a compound tool like join_objects may need more than one
+  undo() call to fully reverse.
+- The `_for_cli` tools open a .blend file in a fresh, throwaway
+  background Blender process - no live session, no undo, and nothing is
+  saved automatically. They only support read-only inspection plus
+  execute_code_for_cli.
+- Never re-exec or hot-reload the add-on's own source from inside
+  execute_code - it can corrupt the connection currently serving that
+  request and require a full Blender restart.
+"""
+
+mcp = FastMCP("blender", instructions=SERVER_INSTRUCTIONS)
 
 
 class BlenderConnection:
@@ -598,6 +648,8 @@ def execute_code(code: str, timeout: float = DEFAULT_TIMEOUT) -> dict:
     results come back as their repr). `print()` output is captured and
     returned as `stdout`/`stderr` (each capped, with a trailing truncation
     marker if exceeded) - handy for debugging while iterating on a script.
+    Captured output is included even when the script raises, so a partial
+    print() trail isn't lost when something fails partway through.
     Use for anything not covered by the other tools (modifiers, geometry
     nodes, UV work, etc.); raise timeout (seconds) for long-running scripts
     like physics bakes. A few destructive calls (`bpy.ops.wm.quit_blender`
@@ -629,8 +681,9 @@ def save_file(filepath: Optional[str] = None) -> dict:
 
 @mcp.tool()
 def get_objects_summary() -> dict:
-    """Get the scene's collection hierarchy (nested collections and the
-    objects directly in each one), unlike get_scene_info's flat object list."""
+    """Get the scene's collection hierarchy: nested collections, each with
+    its direct objects (name, type, parent, data-block name, selection,
+    visibility) - unlike get_scene_info's flat object list."""
     return _conn.send_command("get_objects_summary", {})
 
 
@@ -643,10 +696,15 @@ def get_window_summary() -> dict:
 
 
 @mcp.tool()
-def jump_to_view3d_object(name: str) -> dict:
+def jump_to_view3d_object(name: str, allow_edits: bool = False) -> dict:
     """Select the named object, make it active, and frame it in the 3D
-    viewport (like pressing Numpad-. after selecting it)."""
-    return _conn.send_command("jump_to_view3d_object", {"name": name})
+    viewport (like pressing Numpad-. after selecting it). If the object is
+    hidden or its collection is excluded from the view layer, this fails
+    unless allow_edits=True, which un-hides it and enables its collection
+    first."""
+    return _conn.send_command(
+        "jump_to_view3d_object", {"name": name, "allow_edits": allow_edits}
+    )
 
 
 @mcp.tool()
@@ -733,32 +791,54 @@ def render_viewport_to_path(
 
 
 @mcp.tool()
-def get_screenshot_of_area_as_image(area_type: str = "VIEW_3D") -> Image:
-    """Capture a screenshot of one editor area by type (e.g. 'VIEW_3D',
-    'NODE_EDITOR', 'IMAGE_EDITOR', 'PROPERTIES', 'OUTLINER') - the first area
-    of that type found across all open windows. Use get_viewport_screenshot
-    for the common 3D-viewport case; this covers any other editor."""
-    result = _conn.send_command("get_screenshot_of_area", {"area_type": area_type})
+def get_screenshot_of_area_as_image(
+    area_ui_type: str = "VIEW_3D",
+    size_limit_in_bytes: int = 0,
+) -> Image:
+    """Capture a screenshot of one editor area by its ui_type (e.g.
+    'VIEW_3D', 'PROPERTIES', 'OUTLINER', 'ShaderNodeTree',
+    'CompositorNodeTree', 'GeometryNodeTree' - ui_type distinguishes editors
+    that share the same broad area type, like the three different node-tree
+    editors) - the first matching area found across all open windows. Use
+    get_viewport_screenshot for the common 3D-viewport case; this covers any
+    other editor. size_limit_in_bytes caps the image size, downscaling if
+    needed; 0 (default) uses a built-in limit."""
+    size_limit_in_bytes = _bounded_int(
+        size_limit_in_bytes, "size_limit_in_bytes", minimum=0, maximum=MAX_RESPONSE_BYTES
+    )
+    result = _conn.send_command(
+        "get_screenshot_of_area",
+        {"area_ui_type": area_ui_type, "size_limit_in_bytes": size_limit_in_bytes},
+    )
     return _decode_png_result(result)
 
 
 @mcp.tool()
-def get_screenshot_of_window_as_image() -> Image:
+def get_screenshot_of_window_as_image(size_limit_in_bytes: int = 0) -> Image:
     """Capture a screenshot of the entire Blender window (every visible area
     combined), unlike get_viewport_screenshot/get_screenshot_of_area_as_image
-    which capture a single area."""
-    result = _conn.send_command("get_screenshot_of_window", {})
+    which capture a single area. size_limit_in_bytes caps the image size,
+    downscaling if needed; 0 (default) uses a built-in limit."""
+    size_limit_in_bytes = _bounded_int(
+        size_limit_in_bytes, "size_limit_in_bytes", minimum=0, maximum=MAX_RESPONSE_BYTES
+    )
+    result = _conn.send_command(
+        "get_screenshot_of_window", {"size_limit_in_bytes": size_limit_in_bytes}
+    )
     return _decode_png_result(result)
 
 
 @mcp.tool()
-def jump_to_view3d_object_data(name: str) -> dict:
+def jump_to_view3d_object_data(name: str, allow_edits: bool = False) -> dict:
     """Select and frame in the 3D viewport whichever object uses the
     data-block named `name` (e.g. a mesh, curve, or armature data name),
     rather than looking up an object by its own name like
     jump_to_view3d_object does. Useful when several objects share one
-    mesh/data-block and you want to find them by that shared data's name."""
-    return _conn.send_command("jump_to_view3d_object_data", {"name": name})
+    mesh/data-block and you want to find them by that shared data's name.
+    See jump_to_view3d_object for what allow_edits does."""
+    return _conn.send_command(
+        "jump_to_view3d_object_data", {"name": name, "allow_edits": allow_edits}
+    )
 
 
 @mcp.tool()
@@ -769,12 +849,16 @@ def jump_to_tab_by_name(name: str) -> dict:
 
 
 @mcp.tool()
-def jump_to_tab_by_space_type(space_type: str) -> dict:
+def jump_to_tab_by_space_type(space_type: str, allow_edits: bool = False) -> dict:
     """Switch to whichever workspace has an area of the given editor type
     (e.g. 'NODE_EDITOR', 'IMAGE_EDITOR', 'SEQUENCE_EDITOR') - use this when
     you know what kind of editor you need but not which workspace tab has
-    it."""
-    return _conn.send_command("jump_to_tab_by_space_type", {"space_type": space_type})
+    it. If no workspace has a matching area, this fails unless
+    allow_edits=True, which creates one by duplicating the current
+    workspace and converting its largest area to that type."""
+    return _conn.send_command(
+        "jump_to_tab_by_space_type", {"space_type": space_type, "allow_edits": allow_edits}
+    )
 
 
 # ---------------------------------------------------------------------------

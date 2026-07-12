@@ -57,6 +57,7 @@ _running = False
 _bound_port = None
 _command_queue = queue.Queue(maxsize=MAX_PENDING_COMMANDS)
 _timer_registered = False
+_idle_countdown = 0  # remaining active-rate ticks before _process_queue drops to idle rate
 _client_sockets_lock = threading.Lock()
 _client_sockets = {}
 _generation = 0
@@ -139,6 +140,24 @@ def _require_object_mode():
         raise RuntimeError(
             f"Blender is in '{bpy.context.mode}' mode; switch to Object Mode before running this command"
         )
+
+
+def _online_access_allowed():
+    """Whether Blender's system-level "Allow Online Access" preference
+    permits this add-on to open a network socket. A wrapper function (rather
+    than reading bpy.app.online_access inline) so tests can monkeypatch it -
+    bpy.app.online_access itself is read-only. Missing on older Blender
+    versions that predate this preference, in which case default to allowed.
+    Whether binding to localhost really counts as "online" is a grey area;
+    this errs conservative and gates it like any other network access."""
+    return getattr(bpy.app, "online_access", True)
+
+
+def _log_enabled():
+    try:
+        return bool(bpy.context.scene.blender_mcp_settings.use_log)
+    except BaseException:
+        return False
 
 
 def _apply_rotation(obj, euler_xyz):
@@ -529,6 +548,9 @@ _DEFAULT_THUMBNAIL_PATH = os.path.join(tempfile.gettempdir(), "blender_mcp_thumb
 _DEFAULT_VIEWPORT_RENDER_PATH = os.path.join(tempfile.gettempdir(), "blender_mcp_viewport_render.png")
 _DEFAULT_AREA_SCREENSHOT_PATH = os.path.join(tempfile.gettempdir(), "blender_mcp_area_screenshot.png")
 _DEFAULT_WINDOW_SCREENSHOT_PATH = os.path.join(tempfile.gettempdir(), "blender_mcp_window_screenshot.png")
+DEFAULT_SCREENSHOT_SIZE_LIMIT_BYTES = 4 * 1024 * 1024
+MIN_SCREENSHOT_DOWNSCALE_DIMENSION = 64
+MAX_SCREENSHOT_DOWNSCALE_ITERATIONS = 12
 
 
 def cmd_render_scene(params):
@@ -646,17 +668,43 @@ def cmd_render_viewport(params):
     return result
 
 
-def _screenshot_area(area_type, filepath):
+def _downscale_image_to_size_limit(filepath, size_limit_bytes):
+    """Halve filepath's dimensions (re-encoding each step) until it fits
+    size_limit_bytes or MIN_SCREENSHOT_DOWNSCALE_DIMENSION is reached.
+    A no-op when size_limit_bytes is 0 or the file already fits."""
+    if size_limit_bytes <= 0 or os.path.getsize(filepath) <= size_limit_bytes:
+        return
+    import imbuf
+    im = imbuf.load(filepath)
+    try:
+        for _ in range(MAX_SCREENSHOT_DOWNSCALE_ITERATIONS):
+            width, height = im.size
+            new_width, new_height = max(1, width // 2), max(1, height // 2)
+            if (
+                new_width < MIN_SCREENSHOT_DOWNSCALE_DIMENSION
+                or new_height < MIN_SCREENSHOT_DOWNSCALE_DIMENSION
+            ):
+                break
+            im.resize((new_width, new_height), method='BILINEAR')
+            imbuf.write(im, filepath=filepath)
+            if os.path.getsize(filepath) <= size_limit_bytes:
+                break
+    finally:
+        im.free()
+
+
+def _screenshot_area(area_ui_type, filepath, size_limit_bytes):
     for window in bpy.context.window_manager.windows:
         for area in window.screen.areas:
-            if area.type == area_type:
+            if area.ui_type == area_ui_type:
                 with bpy.context.temp_override(window=window, area=area):
                     shot_result = bpy.ops.screen.screenshot_area(filepath=filepath)
                 if 'FINISHED' not in shot_result:
                     raise RuntimeError(f"Screenshot did not complete (result: {shot_result!r})")
+                _downscale_image_to_size_limit(filepath, size_limit_bytes)
                 with open(filepath, "rb") as f:
                     return base64.b64encode(f.read()).decode("ascii")
-    raise RuntimeError(f"No '{area_type}' area found to screenshot")
+    raise RuntimeError(f"No '{area_ui_type}' area found to screenshot")
 
 
 def cmd_get_viewport_screenshot(params):
@@ -665,18 +713,26 @@ def cmd_get_viewport_screenshot(params):
         params.get("filepath") or _DEFAULT_SCREENSHOT_PATH, "filepath", max_length=4096
     )
     filepath = bpy.path.abspath(filepath_param)
-    data = _screenshot_area("VIEW_3D", filepath)
+    data = _screenshot_area("VIEW_3D", filepath, 0)
     return {"filepath": filepath, "image_base64": data}
 
 
 def cmd_get_screenshot_of_area(params):
     _require_mapping(params, "params")
-    area_type = _require_string(params.get("area_type", "VIEW_3D"), "area_type", max_length=64)
+    area_ui_type = _require_string(
+        params.get("area_ui_type", "VIEW_3D"), "area_ui_type", max_length=64
+    )
     filepath_param = _require_string(
         params.get("filepath") or _DEFAULT_AREA_SCREENSHOT_PATH, "filepath", max_length=4096
     )
+    size_limit_bytes = _require_int(
+        params.get("size_limit_in_bytes", 0), "size_limit_in_bytes",
+        minimum=0, maximum=MAX_RESPONSE_BYTES,
+    )
     filepath = bpy.path.abspath(filepath_param)
-    data = _screenshot_area(area_type, filepath)
+    data = _screenshot_area(
+        area_ui_type, filepath, size_limit_bytes or DEFAULT_SCREENSHOT_SIZE_LIMIT_BYTES
+    )
     return {"filepath": filepath, "image_base64": data}
 
 
@@ -685,12 +741,19 @@ def cmd_get_screenshot_of_window(params):
     filepath_param = _require_string(
         params.get("filepath") or _DEFAULT_WINDOW_SCREENSHOT_PATH, "filepath", max_length=4096
     )
+    size_limit_bytes = _require_int(
+        params.get("size_limit_in_bytes", 0), "size_limit_in_bytes",
+        minimum=0, maximum=MAX_RESPONSE_BYTES,
+    )
     filepath = bpy.path.abspath(filepath_param)
     if not bpy.context.window_manager.windows:
         raise RuntimeError("No window available to screenshot")
     shot_result = bpy.ops.screen.screenshot(filepath=filepath)
     if 'FINISHED' not in shot_result:
         raise RuntimeError(f"Screenshot did not complete (result: {shot_result!r})")
+    _downscale_image_to_size_limit(
+        filepath, size_limit_bytes or DEFAULT_SCREENSHOT_SIZE_LIMIT_BYTES
+    )
     with open(filepath, "rb") as f:
         data = base64.b64encode(f.read()).decode("ascii")
     return {"filepath": filepath, "image_base64": data}
@@ -1075,6 +1138,18 @@ def _truncate_captured_output(text):
     return truncated + f"\n... [truncated, {len(encoded)} bytes total]"
 
 
+class _CapturedOutputError(RuntimeError):
+    """Raised by cmd_execute_code instead of the original exec() failure, so
+    print() output captured before the failure survives into the outer
+    error response. _execute_queued_command attaches .stdout/.stderr to the
+    response for any exception that carries them (see its except block)."""
+
+    def __init__(self, original_exc, stdout, stderr):
+        super().__init__(str(original_exc))
+        self.stdout = stdout
+        self.stderr = stderr
+
+
 # execute_code guardrails: not a real sandbox, just cheap guidance against
 # accidentally wrecking the user's session - "if the LLM (or its user) is
 # motivated, these can be worked around." A determined attacker isn't the
@@ -1154,7 +1229,14 @@ def cmd_execute_code(params):
     original_stdout, original_stderr, original_exit = sys.stdout, sys.stderr, sys.exit
     sys.stdout, sys.stderr, sys.exit = stdout_tee, stderr_tee, _blocked_sys_exit
     try:
-        exec(compile(code, "<mcp_execute_code>", "exec"), local_ns, local_ns)
+        try:
+            exec(compile(code, "<mcp_execute_code>", "exec"), local_ns, local_ns)
+        except BaseException as exc:
+            raise _CapturedOutputError(
+                exc,
+                _truncate_captured_output(stdout_tee.getvalue()),
+                _truncate_captured_output(stderr_tee.getvalue()),
+            ) from exc
     finally:
         sys.stdout, sys.stderr, sys.exit = original_stdout, original_stderr, original_exit
     result = local_ns.get("result")
@@ -1191,6 +1273,17 @@ def cmd_save_file(params):
 # Introspection / analysis commands (all read-only; none push undo steps)
 # ---------------------------------------------------------------------------
 
+def _object_brief_summary(obj):
+    return {
+        "name": obj.name,
+        "type": obj.type,
+        "parent": obj.parent.name if obj.parent else None,
+        "data_name": obj.data.name if obj.data is not None else None,
+        "selected": obj.select_get(),
+        "visible": obj.visible_get(),
+    }
+
+
 def cmd_get_objects_summary(params):
     _require_mapping(params, "params")
 
@@ -1202,7 +1295,7 @@ def cmd_get_objects_summary(params):
         visited = visited | {collection.name}
         return {
             "name": collection.name,
-            "objects": [obj.name for obj in collection.objects],
+            "objects": [_object_brief_summary(obj) for obj in collection.objects],
             "children": [collection_summary(child, visited) for child in collection.children],
         }
 
@@ -1241,10 +1334,46 @@ def cmd_get_window_summary(params):
     }
 
 
-def _focus_view3d_on_object(obj):
+def _enable_layer_collections_for_object(obj):
+    """Recursively clear exclude/hide-viewport on every layer collection
+    backing one of obj's collections, so it can be selected."""
+    object_collections = set(obj.users_collection)
+
+    def walk(layer_collection):
+        if layer_collection.collection in object_collections:
+            layer_collection.exclude = False
+            layer_collection.hide_viewport = False
+        for child in layer_collection.children:
+            walk(child)
+
+    walk(bpy.context.view_layer.layer_collection)
+
+
+def _focus_view3d_on_object(obj, allow_edits=False):
+    if allow_edits:
+        # Selection silently no-ops on a hidden object and raises outright
+        # on one whose collection is excluded from the view layer - fix
+        # both before attempting to select, rather than after failing.
+        if obj.hide_get():
+            obj.hide_set(False)
+        if obj.hide_viewport:
+            obj.hide_viewport = False
+        _enable_layer_collections_for_object(obj)
+
     for obj_iter in bpy.context.view_layer.objects:
         obj_iter.select_set(False)
-    obj.select_set(True)
+    try:
+        obj.select_set(True)
+    except RuntimeError as exc:
+        raise RuntimeError(
+            f"Could not select '{obj.name}' to focus it ({exc}). Pass "
+            "allow_edits=true to enable its collection in the view layer first."
+        ) from exc
+    if not obj.select_get():
+        raise RuntimeError(
+            f"Could not select '{obj.name}' to focus it (likely hidden). "
+            "Pass allow_edits=true to un-hide it first."
+        )
     bpy.context.view_layer.objects.active = obj
     for window in bpy.context.window_manager.windows:
         for area in window.screen.areas:
@@ -1259,16 +1388,18 @@ def _focus_view3d_on_object(obj):
 def cmd_jump_to_view3d_object(params):
     _require_mapping(params, "params")
     name = _require_name(params)
+    allow_edits = _require_bool(params.get("allow_edits", False), "allow_edits")
     obj = _get_scene_object(name)
     if obj is None:
         raise ValueError(f"No object named '{name}'")
-    _focus_view3d_on_object(obj)
+    _focus_view3d_on_object(obj, allow_edits=allow_edits)
     return {"focused": name}
 
 
 def cmd_jump_to_view3d_object_data(params):
     _require_mapping(params, "params")
     data_name = _require_name(params)
+    allow_edits = _require_bool(params.get("allow_edits", False), "allow_edits")
     target = next(
         (
             obj for obj in bpy.context.scene.objects
@@ -1278,7 +1409,7 @@ def cmd_jump_to_view3d_object_data(params):
     )
     if target is None:
         raise ValueError(f"No object in the scene uses a data-block named '{data_name}'")
-    _focus_view3d_on_object(target)
+    _focus_view3d_on_object(target, allow_edits=allow_edits)
     return {"focused": target.name, "data_name": data_name}
 
 
@@ -1299,19 +1430,50 @@ def cmd_jump_to_tab_by_name(params):
 def cmd_jump_to_tab_by_space_type(params):
     _require_mapping(params, "params")
     space_type = _require_string(params.get("space_type", ""), "space_type", max_length=64)
+    allow_edits = _require_bool(params.get("allow_edits", False), "allow_edits")
+    windows = list(bpy.context.window_manager.windows)
+    if not windows:
+        raise RuntimeError("No window available to switch workspace on")
+
     for workspace in bpy.data.workspaces:
         if any(
             area.type == space_type
             for screen in workspace.screens
             for area in screen.areas
         ):
-            windows = list(bpy.context.window_manager.windows)
-            if not windows:
-                raise RuntimeError("No window available to switch workspace on")
             for window in windows:
                 window.workspace = workspace
             return {"workspace": workspace.name}
-    raise ValueError(f"No workspace has a '{space_type}' area")
+
+    if not allow_edits:
+        raise ValueError(
+            f"No workspace has a '{space_type}' area. Pass allow_edits=true to "
+            "create one by duplicating the current workspace."
+        )
+
+    # window.workspace doesn't reflect a switch until Blender's next
+    # window-manager event tick (confirmed elsewhere in this file), so the
+    # new workspace can't be identified that way; diff bpy.data.workspaces
+    # before/after instead.
+    before_names = {w.name for w in bpy.data.workspaces}
+    with bpy.context.temp_override(window=windows[0]):
+        duplicate_result = bpy.ops.workspace.duplicate()
+    if 'FINISHED' not in duplicate_result:
+        raise RuntimeError(f"Could not duplicate workspace (result: {duplicate_result!r})")
+    new_names = {w.name for w in bpy.data.workspaces} - before_names
+    if not new_names:
+        raise RuntimeError("Could not identify the newly duplicated workspace")
+    new_workspace = bpy.data.workspaces[next(iter(new_names))]
+
+    screen = new_workspace.screens[0]
+    if not screen.areas:
+        raise RuntimeError("New workspace has no areas to convert")
+    target_area = max(screen.areas, key=lambda a: a.width * a.height)
+    target_area.type = space_type
+
+    for window in windows:
+        window.workspace = new_workspace
+    return {"workspace": new_workspace.name}
 
 
 def cmd_render_thumbnail(params):
@@ -1784,6 +1946,8 @@ def _execute_queued_command(command, command_generation):
         command_type = _require_string(command.get("type"), "command type", max_length=128)
         command_params = _require_mapping(command.get("params", {}), "params")
         command = {"id": request_id, "type": command_type, "params": command_params}
+        if _log_enabled():
+            print(f"[blender-mcp] request: {command_type} {command_params}", file=sys.stderr)
         fingerprint = _command_fingerprint(command)
         cached_response = _get_cached_response(request_id, fingerprint)
         if cached_response is not None:
@@ -1808,6 +1972,14 @@ def _execute_queued_command(command, command_generation):
             "error": _safe_exception_text(exc),
             "traceback": _safe_traceback(),
         }
+        # execute_code failures carry any print() output captured before
+        # the exception (see _CapturedOutputError); attach it if present.
+        captured_stdout = getattr(exc, "stdout", None)
+        captured_stderr = getattr(exc, "stderr", None)
+        if captured_stdout:
+            response["stdout"] = captured_stdout
+        if captured_stderr:
+            response["stderr"] = captured_stderr
 
     should_push_undo = (
         command_type in _MUTATING_COMMANDS and handler_succeeded
@@ -1841,6 +2013,8 @@ def _execute_queued_command(command, command_generation):
         _store_cached_response(
             request_id, fingerprint, payload, len(payload.encode("utf-8"))
         )
+    if _log_enabled():
+        print(f"[blender-mcp] response: {response.get('status')}", file=sys.stderr)
     return response
 
 
@@ -1875,18 +2049,30 @@ def _process_queue():
             # A broken response queue must not unregister Blender's timer. The
             # waiting client will observe its normal connection/timeout error.
             pass
-    # Drain fast while commands are waiting, idle politely otherwise. Both
-    # rates are user-configurable (preferences panel) to trade latency for
-    # idle CPU overhead; fall back to the historical defaults if the scene
-    # property isn't available yet (e.g. during registration or in tests).
-    active_interval, idle_interval = 0.0, 0.05
+    # Drain fast while commands are waiting, idle politely otherwise - but
+    # stay at the active rate for a grace period after the queue empties
+    # (poll_interval_idle_delay), so a rapid follow-up call right after a
+    # burst doesn't pay the slower idle interval's latency. All three rates
+    # are user-configurable (preferences panel); fall back to the historical
+    # defaults if the scene property isn't available yet (e.g. during
+    # registration or in tests).
+    global _idle_countdown
+    active_interval, idle_interval, idle_delay = 0.0, 0.05, 0.0
     try:
         settings = bpy.context.scene.blender_mcp_settings
         active_interval = max(0.0, float(settings.poll_interval_active))
         idle_interval = max(0.0, float(settings.poll_interval_idle))
+        idle_delay = max(0.0, float(settings.poll_interval_idle_delay))
     except BaseException:
         pass
-    return active_interval if not _command_queue.empty() else idle_interval
+
+    if processed > 0 or not _command_queue.empty():
+        _idle_countdown = math.ceil(idle_delay / active_interval) if active_interval > 0 else 0
+        return active_interval
+    if _idle_countdown > 0:
+        _idle_countdown -= 1
+        return active_interval
+    return idle_interval
 
 
 def _send_response(conn, response):
@@ -2075,6 +2261,12 @@ def start_server(port):
         if _server_thread is not None and _server_thread.is_alive():
             return
         stop_server()
+    if not _online_access_allowed():
+        raise RuntimeError(
+            "Online access is disabled in Blender's system preferences; enable it "
+            "(Preferences > System > Network > Allow Online Access) before starting "
+            "the MCP server."
+        )
     port = _require_int(port, "port", minimum=1024, maximum=65535)
     sock = None
     try:
@@ -2185,6 +2377,18 @@ class MCP_PG_settings(bpy.types.PropertyGroup):
         "excessive overhead",
         default=0.05, min=0.0, max=5.0,
     )
+    poll_interval_idle_delay: bpy.props.FloatProperty(
+        name="Idle delay",
+        description="Seconds to keep polling at the active rate after the queue "
+        "empties, before dropping to the idle rate",
+        default=5.0, min=0.0, max=60.0,
+    )
+    use_log: bpy.props.BoolProperty(
+        name="Log requests",
+        description="Print every tool request and response status to the "
+        "system console, for debugging",
+        default=False,
+    )
 
 
 class MCP_OT_start(bpy.types.Operator):
@@ -2236,6 +2440,8 @@ class MCP_PT_panel(bpy.types.Panel):
         col = layout.column(align=True)
         col.prop(settings, "poll_interval_active")
         col.prop(settings, "poll_interval_idle")
+        col.prop(settings, "poll_interval_idle_delay")
+        layout.prop(settings, "use_log")
 
 
 _classes = (MCP_PG_settings, MCP_OT_start, MCP_OT_stop, MCP_PT_panel)
