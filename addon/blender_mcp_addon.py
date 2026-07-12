@@ -1386,6 +1386,21 @@ _HANDLERS = {
 }
 
 
+# Commands permitted from blender_mcp_cli_runner.py, which runs a single
+# command against a .blend file opened headless (`blender --background
+# <file>`) with no live interactive session and nobody watching. Limited to
+# handlers that only read bpy.data (no window/viewport dependency) plus the
+# execute_code escape hatch, matching what actually works headlessly.
+CLI_SAFE_COMMANDS = frozenset({
+    "get_blendfile_summary_datablocks",
+    "get_blendfile_summary_missing_files",
+    "get_blendfile_summary_linked_libraries",
+    "get_blendfile_summary_path_info",
+    "get_blendfile_summary_usage_guess",
+    "execute_code",
+})
+
+
 # ---------------------------------------------------------------------------
 # Networking
 # ---------------------------------------------------------------------------

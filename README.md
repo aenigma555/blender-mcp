@@ -21,6 +21,24 @@ Claude  <--MCP (stdio)-->  server/blender_mcp_server.py  <--TCP JSON-->  addon/b
   inspection calls reconnect and retry once after non-timeout connection
   failures; sent mutations are never replayed automatically.
 
+There is a second, independent execution path for `*_for_cli` tools that
+doesn't touch the running interactive session at all:
+
+```
+Claude  <--MCP (stdio)-->  server/blender_mcp_server.py  --spawns-->  blender --background <file>  --python-->  addon/blender_mcp_cli_runner.py
+```
+
+- **addon/blender_mcp_cli_runner.py** — a standalone script (not part of the
+  registered add-on) that loads `blender_mcp_addon.py`'s command handlers
+  directly and runs exactly one of them against whatever `.blend` file
+  Blender opened on its command line, writing a JSON response to a temp file.
+  It never starts the TCP server, never touches `bpy.app.timers`, and has
+  nothing to do with an interactive session's add-on state — each call is a
+  fresh subprocess that exits when done. Only handlers in `CLI_SAFE_COMMANDS`
+  (read-only introspection plus `execute_code`) are permitted, since
+  `--background` mode has no window/viewport and, more importantly, nobody
+  is watching it run.
+
 ## Setup
 
 ### 1. Install the Blender add-on
@@ -99,6 +117,12 @@ sun light, and render it."
 | `get_blendfile_summary_path_info` | Current file's path, save status, size, time since save, local backup count |
 | `get_blendfile_summary_usage_guess` | Heuristic, scored guess at what the file is used for (rigging, geometry nodes, video editing, compositing, grease pencil, static asset) |
 | `get_python_api_docs` | Look up a `bpy` identifier's docstring/properties/functions at runtime; end with `*` after a dot to list matches (e.g. `bpy.types.Mesh*`) |
+| `get_blendfile_summary_datablocks_for_cli` | Same as `get_blendfile_summary_datablocks`, but opens `blend_file` in a background Blender process — no running interactive session needed |
+| `get_blendfile_summary_missing_files_for_cli` | Same as `get_blendfile_summary_missing_files`, background/CLI mode |
+| `get_blendfile_summary_linked_libraries_for_cli` | Same as `get_blendfile_summary_linked_libraries`, background/CLI mode |
+| `get_blendfile_summary_path_info_for_cli` | Same as `get_blendfile_summary_path_info`, background/CLI mode |
+| `get_blendfile_summary_usage_guess_for_cli` | Same as `get_blendfile_summary_usage_guess`, background/CLI mode |
+| `execute_code_for_cli` | Same as `execute_code`, but runs unattended against `blend_file` in a background process; does **not** save automatically |
 
 `execute_code` is the escape hatch for anything not covered above —
 bmesh editing, modifiers, geometry nodes, UV unwrapping, etc. `bpy`,
@@ -115,6 +139,21 @@ currently being edited.
 `undo` maps to Blender's native undo stack. Most commands push exactly one
 step, but an operator-backed compound command such as `join_objects` may push
 internal steps and need more than one `undo` call to fully reverse.
+
+### CLI/background mode
+
+The `*_for_cli` tools open a `.blend` file cold in a fresh `blender
+--background` process instead of talking to a running interactive session —
+useful for inspecting a file Blender doesn't currently have open, or when no
+interactive session is running at all. This requires Blender's executable to
+be discoverable: set `BLENDER_MCP_EXECUTABLE` to its full path if `blender`
+isn't on the MCP server's `PATH`. Each call has its own `timeout` (the
+subprocess is killed and its outcome reported as failed if exceeded) and is
+otherwise fully self-contained: no undo tracking, no dedup cache, no retry —
+a failed or timed-out call can simply be issued again. `execute_code_for_cli`
+does not save the file automatically; call `bpy.ops.wm.save_mainfile()`
+inside `code` if you want changes kept, and remember nobody is watching it
+run interactively.
 
 ### Mirroring and normals
 
@@ -149,10 +188,14 @@ blender --background --factory-startup --python-exit-code 1 \
 
 The Blender suite covers capsule topology, mirror/join normals, validation,
 request deduplication, stale server generations, timer-safe exception
-handling, the blend-file summary/introspection tools, and the add-on's
-auto-start/poll-interval preferences. CI (`.github/workflows/ci.yml`) runs
-the server suite on every push/PR and the Blender suite against both the
-current Blender release and the 4.2 LTS series matching the add-on's
+handling, the blend-file summary/introspection tools, the add-on's
+auto-start/poll-interval preferences, and `blender_mcp_cli_runner.py`'s
+dispatch/allowlist logic (run in-process, without spawning a nested Blender).
+The server suite's mocked-subprocess tests separately cover the CLI mode's
+process-orchestration side (timeouts, non-zero exits, missing files). CI
+(`.github/workflows/ci.yml`) runs the server suite on every push/PR and the
+Blender suite against both the current Blender release and the 4.2 LTS series
+matching the add-on's
 declared minimum version.
 
 ## Notes
@@ -188,6 +231,11 @@ declared minimum version.
   Any local process that can reach the port can invoke tools, and
   `execute_code` can run arbitrary Python with Blender/user permissions. Do
   not proxy, tunnel, or otherwise expose the port to untrusted clients.
+- `execute_code_for_cli` carries the same code-execution risk as
+  `execute_code`, but runs unattended in a background process with no
+  interactive session to notice something going wrong — treat any `.blend`
+  file path you hand it as fully trusted, the same as you would `execute_code`
+  itself.
 - To protect Blender's interactive session, the add-on bounds command and
   response sizes, queued work, concurrent client handlers, render dimensions,
   and its request-response cache. Requests are rejected when those limits are

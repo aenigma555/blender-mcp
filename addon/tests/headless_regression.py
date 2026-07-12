@@ -11,14 +11,19 @@ these tests never start its TCP server or install its timer.
 
 from __future__ import annotations
 
+import base64
 from collections import OrderedDict
 import importlib.util
+import json
 import math
+import os
 from pathlib import Path
 import queue
 import sys
+import tempfile
 from types import SimpleNamespace
 import unittest
+import uuid
 
 import bmesh
 import bpy
@@ -26,21 +31,25 @@ from mathutils import Vector
 
 
 ADDON_PATH = Path(__file__).resolve().parents[1] / "blender_mcp_addon.py"
+RUNNER_PATH = Path(__file__).resolve().parents[1] / "blender_mcp_cli_runner.py"
 
 
-def _load_addon():
-    spec = importlib.util.spec_from_file_location(
-        "blender_mcp_addon_headless_test", ADDON_PATH
-    )
+def _load_module(path: Path, name: str):
+    spec = importlib.util.spec_from_file_location(name, path)
     if spec is None or spec.loader is None:
-        raise RuntimeError(f"Could not load add-on module from {ADDON_PATH}")
+        raise RuntimeError(f"Could not load module from {path}")
     module = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = module
     spec.loader.exec_module(module)
     return module
 
 
+def _load_addon():
+    return _load_module(ADDON_PATH, "blender_mcp_addon_headless_test")
+
+
 ADDON = _load_addon()
+RUNNER = _load_module(RUNNER_PATH, "blender_mcp_cli_runner_headless_test")
 
 
 def _remove_all_objects() -> None:
@@ -151,6 +160,29 @@ class BlenderMCPHeadlessTests(unittest.TestCase):
             self.fail(f"_process_queue leaked {type(exc).__name__}: {exc}")
         self.assertFalse(response_box.empty(), "queued command produced no response")
         return response_box.get_nowait(), next_interval
+
+    def run_cli_command(self, command_type, params):
+        """Exercise blender_mcp_cli_runner.run() in-process, the same way a
+        real `blender --background --python blender_mcp_cli_runner.py --
+        ...` subprocess would, without spawning a nested Blender."""
+        output_path = os.path.join(
+            tempfile.gettempdir(), f"mcp_cli_runner_test_{uuid.uuid4().hex}.json"
+        )
+        params_b64 = base64.b64encode(json.dumps(params).encode("utf-8")).decode("ascii")
+        # setUp() empties ADDON._HANDLERS for the queue tests' isolation; the
+        # runner needs the real dispatch table, restored here for its call only.
+        emptied_handlers = ADDON._HANDLERS
+        ADDON._HANDLERS = self._protocol_globals["_HANDLERS"]
+        try:
+            RUNNER.run(ADDON, command_type, params_b64, output_path)
+            with open(output_path, "r", encoding="utf-8") as f:
+                return json.load(f)
+        finally:
+            ADDON._HANDLERS = emptied_handlers
+            try:
+                os.remove(output_path)
+            except OSError:
+                pass
 
     def assert_closed_connected_mesh(self, obj: bpy.types.Object) -> None:
         self.assertEqual(obj.type, "MESH")
@@ -966,6 +998,53 @@ class BlenderMCPHeadlessTests(unittest.TestCase):
         finally:
             settings.auto_start = False
             ADDON.unregister()
+
+    def test_cli_runner_executes_allowlisted_command(self) -> None:
+        bpy.data.armatures.new("CLIArmature")
+        response = self.run_cli_command("get_blendfile_summary_usage_guess", {})
+        self.assertEqual(response["status"], "ok")
+        labels = {g["label"] for g in response["result"]["guesses"]}
+        self.assertIn("character_rigging", labels)
+
+    def test_cli_runner_rejects_command_outside_allowlist(self) -> None:
+        response = self.run_cli_command("add_primitive", {"type": "cube"})
+        self.assertEqual(response["status"], "error")
+        self.assertIn("not permitted", response["error"])
+        # The handler must never have run.
+        self.assertNotIn("Cube", [o.name for o in bpy.data.objects])
+
+    def test_cli_runner_rejects_unknown_command(self) -> None:
+        # Rejected by the allowlist before the handler lookup even runs
+        # (secure-by-default: unrecognized names never reach dispatch).
+        response = self.run_cli_command("this_command_does_not_exist", {})
+        self.assertEqual(response["status"], "error")
+        self.assertIn("not permitted", response["error"])
+
+    def test_cli_runner_fails_closed_for_allowlisted_but_undispatched_command(self) -> None:
+        # CLI_SAFE_COMMANDS is defined as a subset of _HANDLERS, so this
+        # shouldn't happen in practice - but the runner must fail closed
+        # rather than crash if it ever does.
+        original_safe_commands = ADDON.CLI_SAFE_COMMANDS
+        ADDON.CLI_SAFE_COMMANDS = original_safe_commands | {"not_a_real_handler"}
+        try:
+            response = self.run_cli_command("not_a_real_handler", {})
+        finally:
+            ADDON.CLI_SAFE_COMMANDS = original_safe_commands
+        self.assertEqual(response["status"], "error")
+        self.assertIn("Unknown command type", response["error"])
+
+    def test_cli_runner_reports_handler_error_without_crashing(self) -> None:
+        response = self.run_cli_command("execute_code", {"code": "raise RuntimeError('boom')"})
+        self.assertEqual(response["status"], "error")
+        self.assertIn("boom", response["error"])
+
+    def test_cli_runner_execute_code_reads_scene_state(self) -> None:
+        bpy.data.objects.new("CLICodeObject", None)
+        response = self.run_cli_command(
+            "execute_code", {"code": "result = [o.name for o in bpy.data.objects]"}
+        )
+        self.assertEqual(response["status"], "ok")
+        self.assertIn("CLICodeObject", response["result"]["result"])
 
     def test_process_queue_uses_configured_poll_intervals(self) -> None:
         ADDON.register()

@@ -9,17 +9,22 @@ import binascii
 import json
 import math
 import os
+import shutil
 import socket
+import subprocess
 import tempfile
 import threading
 import time
 import uuid
+from pathlib import Path
 from typing import Any, Literal, Optional
 
 from mcp.server.fastmcp import FastMCP, Image
 
 BLENDER_HOST = os.environ.get("BLENDER_MCP_HOST", "127.0.0.1")
 BLENDER_PORT = int(os.environ.get("BLENDER_MCP_PORT", "9876"))
+BLENDER_EXECUTABLE = os.environ.get("BLENDER_MCP_EXECUTABLE") or shutil.which("blender")
+CLI_RUNNER_PATH = Path(__file__).resolve().parent.parent / "addon" / "blender_mcp_cli_runner.py"
 DEFAULT_TIMEOUT = 120.0
 DEFAULT_RENDER_PATH = os.path.join(tempfile.gettempdir(), "blender_mcp_render.png")
 DEFAULT_THUMBNAIL_PATH = os.path.join(tempfile.gettempdir(), "blender_mcp_thumbnail.png")
@@ -33,6 +38,7 @@ MAX_TIMEOUT = 3600.0
 MAX_JOIN_OBJECTS = 256
 MAX_UNDO_STEPS = 100
 MAX_EXECUTE_CODE_BYTES = 8 * 1024 * 1024
+MAX_CLI_STDERR_CHARS = 4000
 RETRY_SAFE_COMMANDS = frozenset({
     "get_scene_info", "get_object_info", "get_objects_summary", "get_window_summary",
     "get_blendfile_summary_datablocks", "get_blendfile_summary_missing_files",
@@ -192,6 +198,66 @@ class BlenderConnection:
 
 
 _conn = BlenderConnection(BLENDER_HOST, BLENDER_PORT)
+
+
+def _run_cli_command(command_type: str, params: dict, blend_file: str, timeout: float) -> Any:
+    """Run one command against blend_file in a background `blender --background`
+    subprocess, independent of any running interactive session. Unlike
+    _conn.send_command, there is no server to reconnect to and nothing to
+    retry - each call is a fresh, self-contained process."""
+    if not isinstance(blend_file, str) or not blend_file.strip():
+        raise TypeError("blend_file must be a non-empty string")
+    if not os.path.isfile(blend_file):
+        raise FileNotFoundError(f"No such .blend file: {blend_file}")
+    if not BLENDER_EXECUTABLE:
+        raise RuntimeError(
+            "Could not find a Blender executable on PATH; set BLENDER_MCP_EXECUTABLE "
+            "to its full path."
+        )
+    if not CLI_RUNNER_PATH.is_file():
+        raise RuntimeError(f"CLI runner script is missing: {CLI_RUNNER_PATH}")
+
+    params_b64 = base64.b64encode(json.dumps(params).encode("utf-8")).decode("ascii")
+    output_path = os.path.join(tempfile.gettempdir(), f"blender_mcp_cli_{uuid.uuid4().hex}.json")
+    try:
+        try:
+            proc = subprocess.run(
+                [
+                    BLENDER_EXECUTABLE, "--background", "--factory-startup", blend_file,
+                    "--python-exit-code", "1",
+                    "--python", str(CLI_RUNNER_PATH),
+                    "--", command_type, params_b64, output_path,
+                ],
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise TimeoutError(
+                f"Blender did not finish '{command_type}' on {blend_file} "
+                f"within {timeout}s; its outcome is unknown"
+            ) from exc
+
+        if proc.returncode != 0:
+            raise RuntimeError(
+                f"Blender exited with code {proc.returncode} running '{command_type}' "
+                f"on {blend_file}: {proc.stderr[-MAX_CLI_STDERR_CHARS:]}"
+            )
+        if not os.path.isfile(output_path):
+            raise RuntimeError(
+                f"Blender produced no result for '{command_type}' on {blend_file}: "
+                f"{proc.stderr[-MAX_CLI_STDERR_CHARS:]}"
+            )
+        with open(output_path, "r", encoding="utf-8") as f:
+            response = json.load(f)
+        if response.get("status") != "ok":
+            raise RuntimeError(response.get("error") or "Unknown CLI command error")
+        return response.get("result")
+    finally:
+        try:
+            os.remove(output_path)
+        except OSError:
+            pass
 
 
 def _bounded_int(value: int, name: str, *, minimum: int, maximum: int) -> int:
@@ -637,6 +703,77 @@ def get_python_api_docs(identifier: str) -> dict:
     an identifier with '*' after a trailing dot to list matches, e.g.
     'bpy.types.Mesh*' or 'bpy.ops.mesh.*'."""
     return _conn.send_command("get_python_api_docs", {"identifier": identifier})
+
+
+# ---------------------------------------------------------------------------
+# CLI/background mode: runs a command against a .blend file in a fresh
+# `blender --background` subprocess instead of the running interactive
+# session. Useful for inspecting files Blender doesn't currently have open,
+# or when no interactive session is running at all. There is no undo/replay
+# protection here - each call spawns and tears down its own Blender process.
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+def get_blendfile_summary_datablocks_for_cli(blend_file: str, timeout: float = DEFAULT_TIMEOUT) -> dict:
+    """Like get_blendfile_summary_datablocks, but opens blend_file in a
+    background Blender process instead of using the running interactive
+    session - works even if Blender isn't open, or has a different file
+    loaded."""
+    timeout = _finite_number(timeout, "timeout", minimum=1.0e-6, maximum=MAX_TIMEOUT)
+    return _run_cli_command("get_blendfile_summary_datablocks", {}, blend_file, timeout)
+
+
+@mcp.tool()
+def get_blendfile_summary_missing_files_for_cli(blend_file: str, timeout: float = DEFAULT_TIMEOUT) -> dict:
+    """Like get_blendfile_summary_missing_files, but opens blend_file in a
+    background Blender process instead of using the running interactive
+    session."""
+    timeout = _finite_number(timeout, "timeout", minimum=1.0e-6, maximum=MAX_TIMEOUT)
+    return _run_cli_command("get_blendfile_summary_missing_files", {}, blend_file, timeout)
+
+
+@mcp.tool()
+def get_blendfile_summary_linked_libraries_for_cli(blend_file: str, timeout: float = DEFAULT_TIMEOUT) -> dict:
+    """Like get_blendfile_summary_linked_libraries, but opens blend_file in a
+    background Blender process instead of using the running interactive
+    session."""
+    timeout = _finite_number(timeout, "timeout", minimum=1.0e-6, maximum=MAX_TIMEOUT)
+    return _run_cli_command("get_blendfile_summary_linked_libraries", {}, blend_file, timeout)
+
+
+@mcp.tool()
+def get_blendfile_summary_path_info_for_cli(blend_file: str, timeout: float = DEFAULT_TIMEOUT) -> dict:
+    """Like get_blendfile_summary_path_info, but opens blend_file in a
+    background Blender process instead of using the running interactive
+    session."""
+    timeout = _finite_number(timeout, "timeout", minimum=1.0e-6, maximum=MAX_TIMEOUT)
+    return _run_cli_command("get_blendfile_summary_path_info", {}, blend_file, timeout)
+
+
+@mcp.tool()
+def get_blendfile_summary_usage_guess_for_cli(blend_file: str, timeout: float = DEFAULT_TIMEOUT) -> dict:
+    """Like get_blendfile_summary_usage_guess, but opens blend_file in a
+    background Blender process instead of using the running interactive
+    session."""
+    timeout = _finite_number(timeout, "timeout", minimum=1.0e-6, maximum=MAX_TIMEOUT)
+    return _run_cli_command("get_blendfile_summary_usage_guess", {}, blend_file, timeout)
+
+
+@mcp.tool()
+def execute_code_for_cli(blend_file: str, code: str, timeout: float = DEFAULT_TIMEOUT) -> dict:
+    """Like execute_code, but runs against blend_file in a background Blender
+    process instead of the running interactive session, with nobody watching
+    it happen. The file is NOT saved automatically - call
+    bpy.ops.wm.save_mainfile() yourself in code if you want changes kept.
+    Prefer execute_code for anything you can run interactively; use this only
+    when Blender isn't open, or you need to touch a file other than the one
+    currently loaded."""
+    if not isinstance(code, str):
+        raise TypeError("code must be a string")
+    if len(code.encode("utf-8")) > MAX_EXECUTE_CODE_BYTES:
+        raise ValueError(f"code must be at most {MAX_EXECUTE_CODE_BYTES} UTF-8 bytes")
+    timeout = _finite_number(timeout, "timeout", minimum=1.0e-6, maximum=MAX_TIMEOUT)
+    return _run_cli_command("execute_code", {"code": code}, blend_file, timeout)
 
 
 if __name__ == "__main__":
