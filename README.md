@@ -168,6 +168,31 @@ bmesh editing, modifiers, geometry nodes, UV unwrapping, etc. `bpy`,
 predefined; set a variable named `result` in the code to return data
 (non-JSON-serializable results come back as their `repr`).
 
+## Asset-generation workflow
+
+For an interactive asset request, the recommended agent workflow is:
+
+1. Confirm the live session with `get_scene_info`, then capture a viewport
+   baseline for work where appearance matters. Do not use a `*_for_cli` tool
+   as a replacement for editing the user's open Blender scene.
+2. Establish the style, intended use, scale, pose, and references. If the
+   request leaves those open, state the assumed direction before committing to
+   a detailed design.
+3. Build a minimal blockout in a dedicated collection while preserving the
+   rest of the scene. Resolve silhouette and proportions before adding small
+   details.
+4. Review front, side, and three-quarter material-preview or render views.
+   Select one highest-impact visual issue to address per revision.
+5. Refine in order: silhouette/proportions, forms, clothing, face/hair, then
+   materials and lighting. Update owned forms instead of accumulating detached
+   parts with each request to make something "better".
+6. Validate the final scene structure and the deliverable's specific needs
+   (for example, topology for a mesh or output files for a render). Save only
+   when the user asks.
+
+This workflow is also included in the MCP server's advertised instructions,
+so a connected agent receives the same guardrails automatically.
+
 Commands that create, join, or destructively edit objects
 (`add_primitive`, `add_capsule`, `join_objects`, `delete_object`,
 `mirror_object`, `voxel_remesh`, `quad_remesh`, `decimate`, `set_shading`)
