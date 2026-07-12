@@ -47,6 +47,8 @@ class CliModeTests(unittest.TestCase):
 
         def fake_run(argv, **kwargs):
             captured_output_path.append(argv[-1])
+            self.assertTrue(Path(argv[-1]).is_file(), "output path was not reserved")
+            self.assertEqual(Path(argv[-1]).read_text(encoding="utf-8"), "")
             _write_runner_output(argv, {"status": "ok", "result": {"objects": 3}})
             return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
 
@@ -57,6 +59,22 @@ class CliModeTests(unittest.TestCase):
 
         self.assertEqual(result, {"objects": 3})
         self.assertFalse(Path(captured_output_path[0]).exists(), "output file was not cleaned up")
+
+    def test_oversized_output_is_rejected_before_json_parsing(self):
+        original_max_response_bytes = server.MAX_RESPONSE_BYTES
+        server.MAX_RESPONSE_BYTES = 64
+        try:
+            def fake_run(argv, **kwargs):
+                Path(argv[-1]).write_text("x" * 65, encoding="utf-8")
+                return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+
+            with mock.patch.object(server.subprocess, "run", side_effect=fake_run):
+                with self.assertRaisesRegex(RuntimeError, "oversized result"):
+                    server._run_cli_command(
+                        "get_blendfile_summary_path_info", {}, self.blend_file, 30.0
+                    )
+        finally:
+            server.MAX_RESPONSE_BYTES = original_max_response_bytes
 
     def test_argv_encodes_command_and_base64_params(self):
         def fake_run(argv, **kwargs):

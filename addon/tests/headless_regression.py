@@ -1099,6 +1099,32 @@ class BlenderMCPHeadlessTests(unittest.TestCase):
         self.assertFalse(layer_collection.exclude)
         self.assertTrue(obj.select_get())
 
+    def test_enable_layer_collections_also_enables_excluded_ancestors(self) -> None:
+        parent = bpy.data.collections.new("ExcludedParent")
+        child = bpy.data.collections.new("ExcludedChild")
+        bpy.context.scene.collection.children.link(parent)
+        parent.children.link(child)
+        mesh = bpy.data.meshes.new("NestedCollectionMesh")
+        obj = bpy.data.objects.new("NestedCollectionObject", mesh)
+        child.objects.link(obj)
+        try:
+            layer_parent = next(
+                layer for layer in bpy.context.view_layer.layer_collection.children
+                if layer.collection == parent
+            )
+            layer_child = next(
+                layer for layer in layer_parent.children if layer.collection == child
+            )
+            layer_parent.exclude = True
+
+            ADDON._enable_layer_collections_for_object(obj)
+
+            self.assertFalse(layer_parent.exclude)
+            self.assertFalse(layer_child.exclude)
+        finally:
+            bpy.data.objects.remove(obj, do_unlink=True)
+            bpy.data.collections.remove(parent)
+
     def test_jump_to_view3d_object_data_passes_through_allow_edits(self) -> None:
         bpy.ops.mesh.primitive_cube_add()
         obj = bpy.context.active_object
@@ -1225,6 +1251,23 @@ class BlenderMCPHeadlessTests(unittest.TestCase):
                 os.remove(output_path)
             except OSError:
                 pass
+
+    def test_default_image_paths_are_unique_private_temp_files(self) -> None:
+        paths = [
+            ADDON._safe_default_image_path("test"),
+            ADDON._safe_default_image_path("test"),
+        ]
+        try:
+            self.assertNotEqual(*paths)
+            for path in paths:
+                self.assertTrue(os.path.isfile(path))
+                self.assertEqual(os.stat(path).st_mode & 0o077, 0)
+        finally:
+            for path in paths:
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
 
     def test_render_viewport_requires_camera(self) -> None:
         # No active camera, same as the render_scene/render_thumbnail
@@ -1415,6 +1458,28 @@ class BlenderMCPHeadlessTests(unittest.TestCase):
         self.assertEqual(response["status"], "error")
         self.assertIn("boom", response["error"])
 
+    def test_cli_runner_bounds_oversized_handler_results(self) -> None:
+        output_path = os.path.join(tempfile.gettempdir(), f"mcp_cli_bounded_{uuid.uuid4().hex}.json")
+        original_max_response_bytes = ADDON.MAX_RESPONSE_BYTES
+        ADDON.MAX_RESPONSE_BYTES = 256
+        fake_addon = SimpleNamespace(
+            CLI_SAFE_COMMANDS=frozenset({"large_result"}),
+            _HANDLERS={"large_result": lambda _params: {"value": "x" * 300}},
+            _bounded_response=ADDON._bounded_response,
+        )
+        try:
+            RUNNER.run(fake_addon, "large_result", "e30=", output_path)
+            with open(output_path, "r", encoding="utf-8") as f:
+                response = json.load(f)
+            self.assertEqual(response["status"], "error")
+            self.assertIn("Response exceeds", response["error"])
+        finally:
+            ADDON.MAX_RESPONSE_BYTES = original_max_response_bytes
+            try:
+                os.remove(output_path)
+            except OSError:
+                pass
+
     def test_cli_runner_execute_code_reads_scene_state(self) -> None:
         bpy.data.objects.new("CLICodeObject", None)
         response = self.run_cli_command(
@@ -1450,6 +1515,16 @@ class BlenderMCPHeadlessTests(unittest.TestCase):
         })
         self.assertLess(len(result["stdout"].encode("utf-8")), ADDON.MAX_EXECUTE_CODE_OUTPUT_BYTES + 200)
         self.assertIn("truncated", result["stdout"])
+
+    def test_tee_output_caps_memory_while_code_is_still_running(self) -> None:
+        original = io.StringIO()
+        tee = ADDON._TeeOutput(original)
+        tee.write("x" * (ADDON.MAX_EXECUTE_CODE_OUTPUT_BYTES * 2))
+        self.assertLessEqual(
+            len(tee._buffer.getvalue().encode("utf-8")),
+            ADDON.MAX_EXECUTE_CODE_OUTPUT_BYTES,
+        )
+        self.assertIn("truncated", tee.getvalue())
 
     def test_execute_code_blocks_sys_exit(self) -> None:
         with self.assertRaisesRegex(RuntimeError, "sys.exit"):

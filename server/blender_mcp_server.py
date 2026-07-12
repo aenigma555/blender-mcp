@@ -26,11 +26,6 @@ BLENDER_PORT = int(os.environ.get("BLENDER_MCP_PORT", "9876"))
 BLENDER_EXECUTABLE = os.environ.get("BLENDER_MCP_EXECUTABLE") or shutil.which("blender")
 CLI_RUNNER_PATH = Path(__file__).resolve().parent.parent / "addon" / "blender_mcp_cli_runner.py"
 DEFAULT_TIMEOUT = 120.0
-DEFAULT_RENDER_PATH = os.path.join(tempfile.gettempdir(), "blender_mcp_render.png")
-DEFAULT_THUMBNAIL_PATH = os.path.join(tempfile.gettempdir(), "blender_mcp_thumbnail.png")
-DEFAULT_VIEWPORT_RENDER_PATH = os.path.join(tempfile.gettempdir(), "blender_mcp_viewport_render.png")
-DEFAULT_AREA_SCREENSHOT_PATH = os.path.join(tempfile.gettempdir(), "blender_mcp_area_screenshot.png")
-DEFAULT_WINDOW_SCREENSHOT_PATH = os.path.join(tempfile.gettempdir(), "blender_mcp_window_screenshot.png")
 MAX_RESPONSE_BYTES = 64 * 1024 * 1024
 MAX_SCENE_INFO_LIMIT = 10_000
 MAX_RENDER_DIMENSION = 4096
@@ -271,7 +266,8 @@ def _run_cli_command(command_type: str, params: dict, blend_file: str, timeout: 
         raise RuntimeError(f"CLI runner script is missing: {CLI_RUNNER_PATH}")
 
     params_b64 = base64.b64encode(json.dumps(params).encode("utf-8")).decode("ascii")
-    output_path = os.path.join(tempfile.gettempdir(), f"blender_mcp_cli_{uuid.uuid4().hex}.json")
+    output_fd, output_path = tempfile.mkstemp(prefix="blender_mcp_cli_", suffix=".json")
+    os.close(output_fd)
     try:
         try:
             proc = subprocess.run(
@@ -296,13 +292,20 @@ def _run_cli_command(command_type: str, params: dict, blend_file: str, timeout: 
                 f"Blender exited with code {proc.returncode} running '{command_type}' "
                 f"on {blend_file}: {proc.stderr[-MAX_CLI_STDERR_CHARS:]}"
             )
-        if not os.path.isfile(output_path):
+        if not os.path.isfile(output_path) or os.path.getsize(output_path) == 0:
             raise RuntimeError(
                 f"Blender produced no result for '{command_type}' on {blend_file}: "
                 f"{proc.stderr[-MAX_CLI_STDERR_CHARS:]}"
             )
+        if os.path.getsize(output_path) > MAX_RESPONSE_BYTES:
+            raise RuntimeError(
+                f"Blender produced an oversized result for '{command_type}' on {blend_file} "
+                f"(maximum {MAX_RESPONSE_BYTES} bytes)"
+            )
         with open(output_path, "r", encoding="utf-8") as f:
             response = json.load(f)
+        if not isinstance(response, dict):
+            raise RuntimeError(f"Blender returned an invalid CLI response for '{command_type}'")
         if response.get("status") != "ok":
             raise RuntimeError(response.get("error") or "Unknown CLI command error")
         return response.get("result")
@@ -512,7 +515,7 @@ def set_camera(
 
 @mcp.tool()
 def render_scene(
-    filepath: str = DEFAULT_RENDER_PATH,
+    filepath: Optional[str] = None,
     resolution_x: int = 1024,
     resolution_y: int = 1024,
     samples: int = 64,
@@ -532,15 +535,19 @@ def render_scene(
         raise ValueError(f"render size must not exceed {MAX_RENDER_PIXELS} total pixels")
     samples = _bounded_int(samples, "samples", minimum=1, maximum=MAX_RENDER_SAMPLES)
     timeout = _finite_number(timeout, "timeout", minimum=1.0e-6, maximum=MAX_TIMEOUT)
+    params = {
+        "resolution_x": resolution_x,
+        "resolution_y": resolution_y,
+        "samples": samples,
+        "return_image": True,
+    }
+    if filepath is not None:
+        if not isinstance(filepath, str) or not filepath.strip():
+            raise ValueError("filepath must be a non-empty string when provided")
+        params["filepath"] = filepath
     result = _conn.send_command(
         "render_scene",
-        {
-            "filepath": filepath,
-            "resolution_x": resolution_x,
-            "resolution_y": resolution_y,
-            "samples": samples,
-            "return_image": True,
-        },
+        params,
         timeout=timeout,
     )
     return _decode_png_result(result)
@@ -803,7 +810,7 @@ def jump_to_view3d_object(name: str, allow_edits: bool = False) -> dict:
 
 @mcp.tool()
 def render_thumbnail(
-    filepath: str = DEFAULT_THUMBNAIL_PATH,
+    filepath: Optional[str] = None,
     size: int = 128,
     timeout: float = 60,
 ) -> Image:
@@ -812,11 +819,12 @@ def render_thumbnail(
     render use render_scene instead."""
     size = _bounded_int(size, "size", minimum=1, maximum=MAX_THUMBNAIL_DIMENSION)
     timeout = _finite_number(timeout, "timeout", minimum=1.0e-6, maximum=MAX_TIMEOUT)
-    result = _conn.send_command(
-        "render_thumbnail",
-        {"filepath": filepath, "size": size, "return_image": True},
-        timeout=timeout,
-    )
+    params = {"size": size, "return_image": True}
+    if filepath is not None:
+        if not isinstance(filepath, str) or not filepath.strip():
+            raise ValueError("filepath must be a non-empty string when provided")
+        params["filepath"] = filepath
+    result = _conn.send_command("render_thumbnail", params, timeout=timeout)
     return _decode_png_result(result)
 
 
@@ -869,7 +877,7 @@ def get_python_api_docs(identifier: str) -> dict:
 
 @mcp.tool()
 def render_viewport_to_path(
-    filepath: str = DEFAULT_VIEWPORT_RENDER_PATH,
+    filepath: Optional[str] = None,
     timeout: float = 600,
 ) -> Image:
     """Render using whatever engine/resolution/samples the scene already has
@@ -878,9 +886,12 @@ def render_viewport_to_path(
     low-quality preview), this reflects exactly what a normal Render >
     Render Image would produce right now."""
     timeout = _finite_number(timeout, "timeout", minimum=1.0e-6, maximum=MAX_TIMEOUT)
-    result = _conn.send_command(
-        "render_viewport", {"filepath": filepath, "return_image": True}, timeout=timeout
-    )
+    params = {"return_image": True}
+    if filepath is not None:
+        if not isinstance(filepath, str) or not filepath.strip():
+            raise ValueError("filepath must be a non-empty string when provided")
+        params["filepath"] = filepath
+    result = _conn.send_command("render_viewport", params, timeout=timeout)
     return _decode_png_result(result)
 
 

@@ -563,15 +563,36 @@ def cmd_set_camera(params):
     return _obj_summary(cam)
 
 
-_DEFAULT_RENDER_PATH = os.path.join(tempfile.gettempdir(), "blender_mcp_render.png")
-_DEFAULT_SCREENSHOT_PATH = os.path.join(tempfile.gettempdir(), "blender_mcp_viewport.png")
-_DEFAULT_THUMBNAIL_PATH = os.path.join(tempfile.gettempdir(), "blender_mcp_thumbnail.png")
-_DEFAULT_VIEWPORT_RENDER_PATH = os.path.join(tempfile.gettempdir(), "blender_mcp_viewport_render.png")
-_DEFAULT_AREA_SCREENSHOT_PATH = os.path.join(tempfile.gettempdir(), "blender_mcp_area_screenshot.png")
-_DEFAULT_WINDOW_SCREENSHOT_PATH = os.path.join(tempfile.gettempdir(), "blender_mcp_window_screenshot.png")
+def _safe_default_image_path(label):
+    """Reserve a private, unique default image path in the system temp dir.
+
+    Fixed /tmp filenames let separate Blender sessions overwrite one another
+    and, on shared hosts, can be replaced with a symlink before a render
+    writes to them. The file is intentionally retained as the caller-visible
+    render/screenshot artifact, just as it was with the historical defaults.
+    """
+    fd, path = tempfile.mkstemp(prefix=f"blender_mcp_{label}_", suffix=".png")
+    os.close(fd)
+    return path
+
+
 DEFAULT_SCREENSHOT_SIZE_LIMIT_BYTES = 4 * 1024 * 1024
 MIN_SCREENSHOT_DOWNSCALE_DIMENSION = 64
 MAX_SCREENSHOT_DOWNSCALE_ITERATIONS = 12
+# Base64 expands data by roughly one third, and the surrounding JSON has a
+# small fixed overhead. Keep raw image files safely below the wire limit.
+MAX_IMAGE_FILE_BYTES = ((MAX_RESPONSE_BYTES - 8 * 1024) * 3) // 4
+
+
+def _image_file_to_base64(filepath):
+    size = os.path.getsize(filepath)
+    if size > MAX_IMAGE_FILE_BYTES:
+        raise RuntimeError(
+            f"Image is {size} bytes, exceeding the {MAX_IMAGE_FILE_BYTES}-byte "
+            "limit for an MCP image response"
+        )
+    with open(filepath, "rb") as f:
+        return base64.b64encode(f.read()).decode("ascii")
 
 
 def cmd_render_scene(params):
@@ -594,11 +615,14 @@ def cmd_render_scene(params):
     samples = _require_int(
         params.get("samples", 64), "samples", minimum=1, maximum=MAX_RENDER_SAMPLES
     )
-    filepath_param = params.get("filepath") or _DEFAULT_RENDER_PATH
-    filepath_param = _require_string(filepath_param, "filepath", max_length=4096)
+    filepath_param = params.get("filepath")
+    if filepath_param is not None:
+        filepath_param = _require_string(filepath_param, "filepath", max_length=4096)
     return_image = _require_bool(params.get("return_image", True), "return_image")
     if scene.camera is None:
         raise RuntimeError("Scene has no active camera; use set_camera first")
+    if filepath_param is None:
+        filepath_param = _safe_default_image_path("render")
 
     render = scene.render
     engine = render.engine
@@ -646,8 +670,7 @@ def cmd_render_scene(params):
 
     result = {"filepath": filepath}
     if return_image:
-        with open(filepath, "rb") as f:
-            result["image_base64"] = base64.b64encode(f.read()).decode("ascii")
+        result["image_base64"] = _image_file_to_base64(filepath)
     return result
 
 
@@ -657,11 +680,14 @@ def cmd_render_viewport(params):
     render_thumbnail (which always overrides them for speed)."""
     _require_mapping(params, "params")
     scene = bpy.context.scene
-    filepath_param = params.get("filepath") or _DEFAULT_VIEWPORT_RENDER_PATH
-    filepath_param = _require_string(filepath_param, "filepath", max_length=4096)
+    filepath_param = params.get("filepath")
+    if filepath_param is not None:
+        filepath_param = _require_string(filepath_param, "filepath", max_length=4096)
     return_image = _require_bool(params.get("return_image", True), "return_image")
     if scene.camera is None:
         raise RuntimeError("Scene has no active camera; use set_camera first")
+    if filepath_param is None:
+        filepath_param = _safe_default_image_path("viewport_render")
 
     render = scene.render
     saved = {
@@ -684,8 +710,7 @@ def cmd_render_viewport(params):
 
     result = {"filepath": filepath}
     if return_image:
-        with open(filepath, "rb") as f:
-            result["image_base64"] = base64.b64encode(f.read()).decode("ascii")
+        result["image_base64"] = _image_file_to_base64(filepath)
     return result
 
 
@@ -723,18 +748,17 @@ def _screenshot_area(area_ui_type, filepath, size_limit_bytes):
                 if 'FINISHED' not in shot_result:
                     raise RuntimeError(f"Screenshot did not complete (result: {shot_result!r})")
                 _downscale_image_to_size_limit(filepath, size_limit_bytes)
-                with open(filepath, "rb") as f:
-                    return base64.b64encode(f.read()).decode("ascii")
+                return _image_file_to_base64(filepath)
     raise RuntimeError(f"No '{area_ui_type}' area found to screenshot")
 
 
 def cmd_get_viewport_screenshot(params):
     _require_mapping(params, "params")
     filepath_param = _require_string(
-        params.get("filepath") or _DEFAULT_SCREENSHOT_PATH, "filepath", max_length=4096
+        params.get("filepath") or _safe_default_image_path("viewport"), "filepath", max_length=4096
     )
     filepath = bpy.path.abspath(filepath_param)
-    data = _screenshot_area("VIEW_3D", filepath, 0)
+    data = _screenshot_area("VIEW_3D", filepath, DEFAULT_SCREENSHOT_SIZE_LIMIT_BYTES)
     return {"filepath": filepath, "image_base64": data}
 
 
@@ -744,11 +768,11 @@ def cmd_get_screenshot_of_area(params):
         params.get("area_ui_type", "VIEW_3D"), "area_ui_type", max_length=64
     )
     filepath_param = _require_string(
-        params.get("filepath") or _DEFAULT_AREA_SCREENSHOT_PATH, "filepath", max_length=4096
+        params.get("filepath") or _safe_default_image_path("area"), "filepath", max_length=4096
     )
     size_limit_bytes = _require_int(
         params.get("size_limit_in_bytes", 0), "size_limit_in_bytes",
-        minimum=0, maximum=MAX_RESPONSE_BYTES,
+        minimum=0, maximum=MAX_IMAGE_FILE_BYTES,
     )
     filepath = bpy.path.abspath(filepath_param)
     data = _screenshot_area(
@@ -760,11 +784,11 @@ def cmd_get_screenshot_of_area(params):
 def cmd_get_screenshot_of_window(params):
     _require_mapping(params, "params")
     filepath_param = _require_string(
-        params.get("filepath") or _DEFAULT_WINDOW_SCREENSHOT_PATH, "filepath", max_length=4096
+        params.get("filepath") or _safe_default_image_path("window"), "filepath", max_length=4096
     )
     size_limit_bytes = _require_int(
         params.get("size_limit_in_bytes", 0), "size_limit_in_bytes",
-        minimum=0, maximum=MAX_RESPONSE_BYTES,
+        minimum=0, maximum=MAX_IMAGE_FILE_BYTES,
     )
     filepath = bpy.path.abspath(filepath_param)
     if not bpy.context.window_manager.windows:
@@ -775,8 +799,7 @@ def cmd_get_screenshot_of_window(params):
     _downscale_image_to_size_limit(
         filepath, size_limit_bytes or DEFAULT_SCREENSHOT_SIZE_LIMIT_BYTES
     )
-    with open(filepath, "rb") as f:
-        data = base64.b64encode(f.read()).decode("ascii")
+    data = _image_file_to_base64(filepath)
     return {"filepath": filepath, "image_base64": data}
 
 
@@ -1265,28 +1288,34 @@ class _TeeOutput:
     def __init__(self, original):
         self._buffer = io.StringIO()
         self._original = original
+        # Leave space for the truncation marker added by getvalue().
+        self._max_buffer_bytes = MAX_EXECUTE_CODE_OUTPUT_BYTES - 128
+        self._buffer_bytes = 0
+        self._total_bytes = 0
 
     def write(self, s):
         self._original.write(s)
-        return self._buffer.write(s)
+        encoded = s.encode("utf-8")
+        self._total_bytes += len(encoded)
+        remaining = self._max_buffer_bytes - self._buffer_bytes
+        if remaining > 0:
+            kept = encoded[:remaining]
+            self._buffer.write(kept.decode("utf-8", errors="ignore"))
+            self._buffer_bytes += len(kept)
+        return len(s)
 
     def flush(self):
         self._original.flush()
 
     def getvalue(self):
-        return self._buffer.getvalue()
+        value = self._buffer.getvalue()
+        if self._total_bytes > self._buffer_bytes:
+            value += f"\n... [truncated, {self._total_bytes} bytes total]"
+        return value
 
 
 def _blocked_sys_exit(*_args, **_kwargs):
     raise RuntimeError("sys.exit() is not allowed in execute_code")
-
-
-def _truncate_captured_output(text):
-    encoded = text.encode("utf-8")
-    if len(encoded) <= MAX_EXECUTE_CODE_OUTPUT_BYTES:
-        return text
-    truncated = encoded[:MAX_EXECUTE_CODE_OUTPUT_BYTES].decode("utf-8", errors="ignore")
-    return truncated + f"\n... [truncated, {len(encoded)} bytes total]"
 
 
 class _CapturedOutputError(RuntimeError):
@@ -1385,8 +1414,8 @@ def cmd_execute_code(params):
         except BaseException as exc:
             raise _CapturedOutputError(
                 exc,
-                _truncate_captured_output(stdout_tee.getvalue()),
-                _truncate_captured_output(stderr_tee.getvalue()),
+                stdout_tee.getvalue(),
+                stderr_tee.getvalue(),
             ) from exc
     finally:
         sys.stdout, sys.stderr, sys.exit = original_stdout, original_stderr, original_exit
@@ -1396,8 +1425,8 @@ def cmd_execute_code(params):
     except (TypeError, ValueError):
         result = repr(result)
     response = {"result": result}
-    stdout_text = _truncate_captured_output(stdout_tee.getvalue())
-    stderr_text = _truncate_captured_output(stderr_tee.getvalue())
+    stdout_text = stdout_tee.getvalue()
+    stderr_text = stderr_tee.getvalue()
     if stdout_text:
         response["stdout"] = stdout_text
     if stderr_text:
@@ -1491,11 +1520,13 @@ def _enable_layer_collections_for_object(obj):
     object_collections = set(obj.users_collection)
 
     def walk(layer_collection):
-        if layer_collection.collection in object_collections:
+        contains_target = layer_collection.collection in object_collections
+        for child in layer_collection.children:
+            contains_target = walk(child) or contains_target
+        if contains_target:
             layer_collection.exclude = False
             layer_collection.hide_viewport = False
-        for child in layer_collection.children:
-            walk(child)
+        return contains_target
 
     walk(bpy.context.view_layer.layer_collection)
 
@@ -1631,11 +1662,14 @@ def cmd_render_thumbnail(params):
     _require_mapping(params, "params")
     scene = bpy.context.scene
     size = _require_int(params.get("size", 128), "size", minimum=1, maximum=MAX_THUMBNAIL_DIMENSION)
-    filepath_param = params.get("filepath") or _DEFAULT_THUMBNAIL_PATH
-    filepath_param = _require_string(filepath_param, "filepath", max_length=4096)
+    filepath_param = params.get("filepath")
+    if filepath_param is not None:
+        filepath_param = _require_string(filepath_param, "filepath", max_length=4096)
     return_image = _require_bool(params.get("return_image", True), "return_image")
     if scene.camera is None:
         raise RuntimeError("Scene has no active camera; use set_camera first")
+    if filepath_param is None:
+        filepath_param = _safe_default_image_path("thumbnail")
 
     render = scene.render
     saved = {
@@ -1675,8 +1709,7 @@ def cmd_render_thumbnail(params):
 
     result = {"filepath": filepath}
     if return_image:
-        with open(filepath, "rb") as f:
-            result["image_base64"] = base64.b64encode(f.read()).decode("ascii")
+        result["image_base64"] = _image_file_to_base64(filepath)
     return result
 
 

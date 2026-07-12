@@ -57,18 +57,15 @@ def run(addon, command_type: str, params_b64: str, output_path: str) -> None:
             "traceback": addon._safe_traceback(),
         }
 
-    try:
-        payload = json.dumps(response)
-    except (TypeError, ValueError) as exc:
-        payload = json.dumps({
-            "status": "error",
-            "error": f"Result not JSON-serializable: {exc}",
-        })
+    _response, payload = addon._bounded_response(response)
     Path(output_path).write_text(payload, encoding="utf-8")
 
 
 def main() -> None:
-    command_type, params_b64, output_path = _cli_args(sys.argv)[:3]
+    args = _cli_args(sys.argv)
+    if len(args) != 3:
+        raise SystemExit("Expected command_type, params, and output_path after '--'")
+    command_type, params_b64, output_path = args
     addon = _load_addon()
     run(addon, command_type, params_b64, output_path)
 
