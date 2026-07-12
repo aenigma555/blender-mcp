@@ -5,3 +5,7 @@ __pycache__/
 build/
 dist/
 *.blend1
+
+# Local generated character examples; retain them locally without versioning.
+/assets/
+/scripts/
