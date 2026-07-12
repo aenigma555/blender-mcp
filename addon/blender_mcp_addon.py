@@ -335,7 +335,7 @@ def start_server(port):
 
 
 def stop_server():
-    global _server_socket, _running
+    global _server_socket, _running, _timer_registered
     _running = False
     if _server_socket is not None:
         try:
@@ -343,6 +343,10 @@ def stop_server():
         except OSError:
             pass
         _server_socket = None
+    if _timer_registered:
+        if bpy.app.timers.is_registered(_process_queue):
+            bpy.app.timers.unregister(_process_queue)
+        _timer_registered = False
 
 
 # ---------------------------------------------------------------------------

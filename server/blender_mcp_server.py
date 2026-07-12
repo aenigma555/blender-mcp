@@ -8,6 +8,7 @@ import base64
 import json
 import os
 import socket
+import threading
 from typing import Any, Optional
 
 from mcp.server.fastmcp import FastMCP, Image
@@ -24,35 +25,41 @@ class BlenderConnection:
         self.port = port
         self.sock: Optional[socket.socket] = None
         self.buf = b""
+        self._lock = threading.Lock()
 
     def _ensure_connected(self):
         if self.sock is None:
-            self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            self.sock.settimeout(120)
-            self.sock.connect((self.host, self.port))
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(120)
+            sock.connect((self.host, self.port))
+            self.sock = sock
 
     def send_command(self, command_type: str, params: dict) -> dict:
-        self._ensure_connected()
-        payload = json.dumps({"type": command_type, "params": params}) + "\n"
-        try:
-            self.sock.sendall(payload.encode("utf-8"))
-            while b"\n" not in self.buf:
-                chunk = self.sock.recv(65536)
-                if not chunk:
-                    raise ConnectionError("Blender closed the connection")
-                self.buf += chunk
-            line, self.buf = self.buf.split(b"\n", 1)
-        except (ConnectionError, OSError) as exc:
-            self.sock = None
-            raise ConnectionError(
-                f"Could not reach Blender at {self.host}:{self.port}. "
-                "Is the Blender MCP Bridge add-on running and its server started? "
-                f"({exc})"
-            ) from exc
-        response = json.loads(line.decode("utf-8"))
-        if response.get("status") != "ok":
-            raise RuntimeError(response.get("error", "Unknown error from Blender"))
-        return response.get("result", {})
+        with self._lock:
+            try:
+                self._ensure_connected()
+                payload = json.dumps({"type": command_type, "params": params}) + "\n"
+                self.sock.sendall(payload.encode("utf-8"))
+                while b"\n" not in self.buf:
+                    chunk = self.sock.recv(65536)
+                    if not chunk:
+                        raise ConnectionError("Blender closed the connection")
+                    self.buf += chunk
+                line, self.buf = self.buf.split(b"\n", 1)
+            except (ConnectionError, OSError) as exc:
+                if self.sock is not None:
+                    self.sock.close()
+                self.sock = None
+                self.buf = b""
+                raise ConnectionError(
+                    f"Could not reach Blender at {self.host}:{self.port}. "
+                    "Is the Blender MCP Bridge add-on running and its server started? "
+                    f"({exc})"
+                ) from exc
+            response = json.loads(line.decode("utf-8"))
+            if response.get("status") != "ok":
+                raise RuntimeError(response.get("error", "Unknown error from Blender"))
+            return response.get("result", {})
 
 
 _conn = BlenderConnection(BLENDER_HOST, BLENDER_PORT)
