@@ -108,6 +108,9 @@ sun light, and render it."
 | `mirror_object` | Duplicate any object, reflecting its world transform across an axis-aligned plane through the origin (like Blender's Object > Mirror) |
 | `parent_object` | Parent one object to another, optionally preserving world transform |
 | `join_objects` | Join multiple mesh objects into one; face winding of mirrored (negative-determinant) sources is corrected automatically |
+| `voxel_remesh` | Rebuild a mesh's topology from a uniform voxel grid; cleans up messy geometry (post-boolean/join, execute_code output) into a solid mesh |
+| `quad_remesh` | Retopologize a manifold mesh into an evenly-flowing quad mesh with roughly `target_faces` faces (QuadriFlow) |
+| `decimate` | Reduce a mesh's polygon count in place: `COLLAPSE` (ratio), `PLANAR` (merge near-flat faces), or `UNSUBDIVIDE` (reverse uniform subdivision) |
 | `set_shading` | Smooth- or flat-shade all faces of a mesh |
 | `undo` | Undo the last N Blender undo steps |
 | `redo` | Redo the last N undone steps |
@@ -144,9 +147,14 @@ predefined; set a variable named `result` in the code to return data
 
 Commands that create, join, or destructively edit objects
 (`add_primitive`, `add_capsule`, `join_objects`, `delete_object`,
-`mirror_object`, `set_shading`) require Blender to be in Object Mode and
-will reject the call otherwise, rather than risk mutating whatever mesh is
-currently being edited.
+`mirror_object`, `voxel_remesh`, `quad_remesh`, `decimate`, `set_shading`)
+require Blender to be in Object Mode and will reject the call otherwise,
+rather than risk mutating whatever mesh is currently being edited.
+
+`voxel_remesh`, `quad_remesh`, and `decimate` mutate a mesh's geometry in
+place; if the target object's mesh data-block is shared with other objects
+(e.g. a linked duplicate), the object is first given its own private copy
+of the mesh so the operation doesn't affect the other users.
 
 `undo` maps to Blender's native undo stack. Most commands push exactly one
 step, but an operator-backed compound command such as `join_objects` may push

@@ -1083,6 +1083,136 @@ def cmd_join_objects(params):
     return _obj_summary(joined)
 
 
+def _prepare_mesh_for_retopology(name, caller):
+    obj = _get_scene_object(name)
+    if obj is None:
+        raise ValueError(f"No object named '{name}'")
+    if obj.type != "MESH":
+        raise ValueError(f"Object '{name}' is type {obj.type}; {caller} only supports MESH objects")
+    if bpy.context.view_layer.objects.get(obj.name) is None:
+        raise ValueError(f"Object '{name}' is not in the active view layer")
+    # These operators mutate obj.data in place - give the object its own copy
+    # first so a mesh shared by other objects (e.g. linked duplicates) isn't
+    # silently remeshed/decimated out from under them.
+    if obj.data.users > 1:
+        obj.data = obj.data.copy()
+    for view_obj in bpy.context.view_layer.objects:
+        view_obj.select_set(False)
+    obj.select_set(True)
+    bpy.context.view_layer.objects.active = obj
+    return obj
+
+
+def _mesh_summary_with_counts(obj):
+    summary = _obj_summary(obj)
+    summary["vertex_count"] = len(obj.data.vertices)
+    summary["face_count"] = len(obj.data.polygons)
+    return summary
+
+
+def cmd_voxel_remesh(params):
+    _require_object_mode()
+    _require_mapping(params, "params")
+    name = _require_name(params)
+    voxel_size = _require_finite_number(
+        params["voxel_size"], "voxel_size", minimum=1.0e-6, maximum=1_000_000.0
+    )
+    adaptivity = _require_finite_number(
+        params.get("adaptivity", 0.0), "adaptivity", minimum=0.0, maximum=1.0
+    )
+    fix_poles = _require_bool(params.get("fix_poles", True), "fix_poles")
+    preserve_volume = _require_bool(params.get("preserve_volume", True), "preserve_volume")
+    preserve_attributes = _require_bool(params.get("preserve_attributes", True), "preserve_attributes")
+
+    prev = _save_selection()
+    try:
+        obj = _prepare_mesh_for_retopology(name, "voxel_remesh")
+        mesh = obj.data
+        mesh.remesh_voxel_size = voxel_size
+        mesh.remesh_voxel_adaptivity = adaptivity
+        mesh.use_remesh_fix_poles = fix_poles
+        mesh.use_remesh_preserve_volume = preserve_volume
+        mesh.use_remesh_preserve_attributes = preserve_attributes
+        result = bpy.ops.object.voxel_remesh()
+        if 'FINISHED' not in result:
+            raise RuntimeError(f"voxel_remesh did not complete (result: {result!r})")
+    finally:
+        _restore_selection(prev)
+    return _mesh_summary_with_counts(obj)
+
+
+def cmd_quad_remesh(params):
+    _require_object_mode()
+    _require_mapping(params, "params")
+    name = _require_name(params)
+    target_faces = _require_int(params["target_faces"], "target_faces", minimum=4, maximum=10_000_000)
+    use_mesh_symmetry = _require_bool(params.get("use_mesh_symmetry", False), "use_mesh_symmetry")
+    preserve_sharp = _require_bool(params.get("preserve_sharp", False), "preserve_sharp")
+    preserve_boundary = _require_bool(params.get("preserve_boundary", False), "preserve_boundary")
+    seed = _require_int(params.get("seed", 0), "seed", minimum=0, maximum=1_000_000)
+
+    prev = _save_selection()
+    try:
+        obj = _prepare_mesh_for_retopology(name, "quad_remesh")
+        result = bpy.ops.object.quadriflow_remesh(
+            mode='FACES',
+            target_faces=target_faces,
+            use_mesh_symmetry=use_mesh_symmetry,
+            use_preserve_sharp=preserve_sharp,
+            use_preserve_boundary=preserve_boundary,
+            seed=seed,
+        )
+        if 'FINISHED' not in result:
+            raise RuntimeError(f"quad_remesh did not complete (result: {result!r})")
+    finally:
+        _restore_selection(prev)
+    return _mesh_summary_with_counts(obj)
+
+
+_DECIMATE_TYPES = frozenset({"COLLAPSE", "UNSUBDIVIDE", "PLANAR"})
+# Maps this add-on's descriptive public names to Blender's actual
+# DecimateModifier.decimate_type enum identifiers.
+_DECIMATE_TYPE_TO_BLENDER = {"COLLAPSE": "COLLAPSE", "UNSUBDIVIDE": "UNSUBDIV", "PLANAR": "DISSOLVE"}
+
+
+def cmd_decimate(params):
+    _require_object_mode()
+    _require_mapping(params, "params")
+    name = _require_name(params)
+    decimate_type = _require_string(params.get("decimate_type", "COLLAPSE"), "decimate_type").upper()
+    if decimate_type not in _DECIMATE_TYPES:
+        raise ValueError(f"decimate_type must be one of {sorted(_DECIMATE_TYPES)}, got '{decimate_type}'")
+
+    prev = _save_selection()
+    modifier = None
+    try:
+        obj = _prepare_mesh_for_retopology(name, "decimate")
+        modifier = obj.modifiers.new(name="MCP_Decimate", type='DECIMATE')
+        modifier.decimate_type = _DECIMATE_TYPE_TO_BLENDER[decimate_type]
+        if decimate_type == "COLLAPSE":
+            modifier.ratio = _require_finite_number(
+                params.get("ratio", 0.5), "ratio", minimum=1.0e-4, maximum=1.0
+            )
+        elif decimate_type == "UNSUBDIVIDE":
+            modifier.iterations = _require_int(
+                params.get("iterations", 1), "iterations", minimum=1, maximum=100
+            )
+        else:  # PLANAR
+            modifier.angle_limit = math.radians(_require_finite_number(
+                params.get("angle_limit_degrees", 5.0), "angle_limit_degrees",
+                minimum=0.0, maximum=180.0
+            ))
+        apply_result = bpy.ops.object.modifier_apply(modifier=modifier.name)
+        if 'FINISHED' not in apply_result:
+            raise RuntimeError(f"decimate did not complete (result: {apply_result!r})")
+        modifier = None
+    finally:
+        if modifier is not None and modifier.name in obj.modifiers:
+            obj.modifiers.remove(modifier)
+        _restore_selection(prev)
+    return _mesh_summary_with_counts(obj)
+
+
 def cmd_set_shading(params):
     _require_object_mode()
     _require_mapping(params, "params")
@@ -1788,6 +1918,9 @@ _HANDLERS = {
     "mirror_object": cmd_mirror_object,
     "parent_object": cmd_parent_object,
     "join_objects": cmd_join_objects,
+    "voxel_remesh": cmd_voxel_remesh,
+    "quad_remesh": cmd_quad_remesh,
+    "decimate": cmd_decimate,
     "set_shading": cmd_set_shading,
     "undo": cmd_undo,
     "redo": cmd_redo,

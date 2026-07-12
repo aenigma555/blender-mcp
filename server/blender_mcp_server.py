@@ -367,6 +367,7 @@ def get_object_info(name: str) -> dict:
 PrimitiveType = Literal["cube", "sphere", "ico_sphere", "cylinder", "cone", "plane", "torus", "monkey"]
 LightType = Literal["POINT", "SUN", "SPOT", "AREA"]
 MirrorAxis = Literal["X", "Y", "Z"]
+DecimateType = Literal["COLLAPSE", "UNSUBDIVIDE", "PLANAR"]
 
 
 @mcp.tool()
@@ -615,6 +616,97 @@ def join_objects(names: list[str], target_name: Optional[str] = None) -> dict:
     if target_name:
         params["target_name"] = target_name
     return _conn.send_command("join_objects", params)
+
+
+@mcp.tool()
+def voxel_remesh(
+    name: str,
+    voxel_size: float,
+    adaptivity: float = 0.0,
+    fix_poles: bool = True,
+    preserve_volume: bool = True,
+    preserve_attributes: bool = True,
+) -> dict:
+    """Rebuild a mesh's topology from a uniform voxel grid (Blender's Remesh >
+    Voxel). Produces a clean, mostly-quad mesh regardless of how messy the
+    input is - good after boolean/join operations or freeform execute_code
+    geometry, before further edits or a decimate pass. Smaller voxel_size
+    means more detail and more geometry; start around 5-10% of the object's
+    largest dimension. Returns vertex_count/face_count so you can judge the
+    result without a screenshot."""
+    voxel_size = _finite_number(voxel_size, "voxel_size", minimum=1.0e-6, maximum=1_000_000.0)
+    adaptivity = _finite_number(adaptivity, "adaptivity", minimum=0.0, maximum=1.0)
+    return _conn.send_command(
+        "voxel_remesh",
+        {
+            "name": name,
+            "voxel_size": voxel_size,
+            "adaptivity": adaptivity,
+            "fix_poles": fix_poles,
+            "preserve_volume": preserve_volume,
+            "preserve_attributes": preserve_attributes,
+        },
+    )
+
+
+@mcp.tool()
+def quad_remesh(
+    name: str,
+    target_faces: int,
+    use_mesh_symmetry: bool = False,
+    preserve_sharp: bool = False,
+    preserve_boundary: bool = False,
+    seed: int = 0,
+) -> dict:
+    """Retopologize a mesh into an evenly-flowing quad mesh with roughly
+    target_faces faces (Blender's QuadriFlow remesh). Better than voxel_remesh
+    for a final, clean, animation/sculpt-ready cage since it produces proper
+    edge flow instead of a uniform grid; requires the input to be a single
+    manifold surface (e.g. run voxel_remesh first if the mesh is messy).
+    Returns vertex_count/face_count."""
+    target_faces = _bounded_int(target_faces, "target_faces", minimum=4, maximum=10_000_000)
+    seed = _bounded_int(seed, "seed", minimum=0, maximum=1_000_000)
+    return _conn.send_command(
+        "quad_remesh",
+        {
+            "name": name,
+            "target_faces": target_faces,
+            "use_mesh_symmetry": use_mesh_symmetry,
+            "preserve_sharp": preserve_sharp,
+            "preserve_boundary": preserve_boundary,
+            "seed": seed,
+        },
+    )
+
+
+@mcp.tool()
+def decimate(
+    name: str,
+    decimate_type: DecimateType = "COLLAPSE",
+    ratio: float = 0.5,
+    iterations: int = 1,
+    angle_limit_degrees: float = 5.0,
+) -> dict:
+    """Reduce a mesh's polygon count in place. decimate_type "COLLAPSE" uses
+    `ratio` (0-1, fraction of faces to keep) and works on any mesh; "PLANAR"
+    merges faces within `angle_limit_degrees` of each other, good for
+    cleaning up flat regions after a voxel_remesh without changing silhouette;
+    "UNSUBDIVIDE" reverses `iterations` levels of uniform subdivision and only
+    works on grid-like topology. Only the parameter matching decimate_type is
+    used. Returns vertex_count/face_count."""
+    ratio = _finite_number(ratio, "ratio", minimum=1.0e-4, maximum=1.0)
+    iterations = _bounded_int(iterations, "iterations", minimum=1, maximum=100)
+    angle_limit_degrees = _finite_number(angle_limit_degrees, "angle_limit_degrees", minimum=0.0, maximum=180.0)
+    return _conn.send_command(
+        "decimate",
+        {
+            "name": name,
+            "decimate_type": decimate_type,
+            "ratio": ratio,
+            "iterations": iterations,
+            "angle_limit_degrees": angle_limit_degrees,
+        },
+    )
 
 
 @mcp.tool()

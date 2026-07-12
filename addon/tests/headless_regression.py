@@ -449,6 +449,92 @@ class BlenderMCPHeadlessTests(unittest.TestCase):
         )
         self.assertLess(centroids[0].x * centroids[1].x, 0.0)
 
+    def test_voxel_remesh_rebuilds_topology_and_preserves_selection(self) -> None:
+        ADDON.cmd_add_primitive({"type": "ico_sphere", "name": "RemeshTarget"})
+        obj = bpy.context.scene.objects["RemeshTarget"]
+        faces_before = len(obj.data.polygons)
+
+        sentinel = bpy.data.objects.new("VoxelRemeshSentinel", None)
+        bpy.context.scene.collection.objects.link(sentinel)
+        for view_obj in bpy.context.view_layer.objects:
+            view_obj.select_set(False)
+        sentinel.select_set(True)
+        bpy.context.view_layer.objects.active = sentinel
+
+        summary = ADDON.cmd_voxel_remesh({"name": "RemeshTarget", "voxel_size": 0.2})
+
+        self.assertEqual(summary["name"], "RemeshTarget")
+        self.assertGreater(summary["vertex_count"], 0)
+        self.assertGreater(summary["face_count"], 0)
+        self.assertNotEqual(len(obj.data.polygons), faces_before)
+        self.assertIs(bpy.context.view_layer.objects.active, sentinel)
+        self.assertEqual(set(bpy.context.selected_objects), {sentinel})
+
+    def test_quad_remesh_targets_requested_face_count(self) -> None:
+        ADDON.cmd_add_primitive({"type": "ico_sphere", "name": "QuadRemeshTarget"})
+        summary = ADDON.cmd_quad_remesh({"name": "QuadRemeshTarget", "target_faces": 50})
+        obj = bpy.context.scene.objects["QuadRemeshTarget"]
+
+        self.assertEqual(summary["face_count"], len(obj.data.polygons))
+        # QuadriFlow only approximates the requested count; a generous
+        # tolerance keeps this test from being flaky across Blender versions.
+        self.assertLess(abs(summary["face_count"] - 50), 30)
+
+    def test_decimate_collapse_reduces_faces_and_leaves_no_modifier(self) -> None:
+        ADDON.cmd_add_primitive({"type": "ico_sphere", "name": "DecimateTarget"})
+        obj = bpy.context.scene.objects["DecimateTarget"]
+        faces_before = len(obj.data.polygons)
+
+        summary = ADDON.cmd_decimate({"name": "DecimateTarget", "decimate_type": "COLLAPSE", "ratio": 0.5})
+
+        self.assertLess(summary["face_count"], faces_before)
+        self.assertEqual(summary["face_count"], len(obj.data.polygons))
+        self.assertEqual(list(obj.modifiers), [])
+
+    def test_decimate_planar_and_unsubdivide_variants_run(self) -> None:
+        ADDON.cmd_add_primitive({"type": "cube", "name": "PlanarTarget"})
+        planar_summary = ADDON.cmd_decimate(
+            {"name": "PlanarTarget", "decimate_type": "PLANAR", "angle_limit_degrees": 45.0}
+        )
+        self.assertGreater(planar_summary["face_count"], 0)
+
+        ADDON.cmd_add_primitive({"type": "cube", "name": "UnsubdivideTarget"})
+        unsub_summary = ADDON.cmd_decimate(
+            {"name": "UnsubdivideTarget", "decimate_type": "UNSUBDIVIDE", "iterations": 1}
+        )
+        self.assertGreater(unsub_summary["face_count"], 0)
+
+    def test_decimate_rejects_unknown_decimate_type(self) -> None:
+        ADDON.cmd_add_primitive({"type": "cube", "name": "BadDecimateType"})
+        with self.assertRaises(ValueError):
+            ADDON.cmd_decimate({"name": "BadDecimateType", "decimate_type": "NOT_A_TYPE"})
+
+    def test_retopology_tools_reject_non_mesh_objects(self) -> None:
+        empty = bpy.data.objects.new("EmptyForRetopology", None)
+        bpy.context.scene.collection.objects.link(empty)
+        with self.assertRaises(ValueError):
+            ADDON.cmd_voxel_remesh({"name": "EmptyForRetopology", "voxel_size": 0.2})
+        with self.assertRaises(ValueError):
+            ADDON.cmd_quad_remesh({"name": "EmptyForRetopology", "target_faces": 50})
+        with self.assertRaises(ValueError):
+            ADDON.cmd_decimate({"name": "EmptyForRetopology", "ratio": 0.5})
+
+    def test_decimate_gives_shared_mesh_object_a_private_copy(self) -> None:
+        ADDON.cmd_add_primitive({"type": "cube", "name": "SharedMeshOwner"})
+        owner = bpy.context.scene.objects["SharedMeshOwner"]
+        sibling = owner.copy()
+        bpy.context.scene.collection.objects.link(sibling)
+        sibling.name = "SharedMeshSibling"
+        self.assertEqual(owner.data.users, 2)
+        shared_mesh = owner.data
+        sibling_face_count_before = len(sibling.data.polygons)
+
+        ADDON.cmd_decimate({"name": "SharedMeshOwner", "decimate_type": "COLLAPSE", "ratio": 0.3})
+
+        self.assertIsNot(owner.data, shared_mesh)
+        self.assertIs(sibling.data, shared_mesh)
+        self.assertEqual(len(sibling.data.polygons), sibling_face_count_before)
+
     def test_get_object_info_reports_children_constraints_data_name_and_collections(
         self,
     ) -> None:
