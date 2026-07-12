@@ -8,15 +8,18 @@ bl_info = {
     "category": "Interface",
 }
 
+import ast
 import base64
 from collections import OrderedDict
 import hashlib
 import inspect
+import io
 import json
 import math
 import os
 import queue
 import socket
+import sys
 import tempfile
 import threading
 import time
@@ -44,6 +47,7 @@ MAX_RENDER_SAMPLES = 4096
 MAX_JOIN_OBJECTS = 256
 MAX_UNDO_STEPS = 100
 MAX_EXECUTE_CODE_BYTES = 8 * 1024 * 1024
+MAX_EXECUTE_CODE_OUTPUT_BYTES = 256 * 1024
 MAX_THUMBNAIL_DIMENSION = 512
 MAX_API_DOCS_MATCHES = 200
 
@@ -1039,6 +1043,95 @@ def cmd_redo(params):
     return {"steps_requested": steps, "steps_performed": performed}
 
 
+class _TeeOutput:
+    """Writes to both an in-memory buffer and the original stream, so
+    print() debugging in execute_code shows up on Blender's console live
+    and is also captured for the MCP response."""
+
+    def __init__(self, original):
+        self._buffer = io.StringIO()
+        self._original = original
+
+    def write(self, s):
+        self._original.write(s)
+        return self._buffer.write(s)
+
+    def flush(self):
+        self._original.flush()
+
+    def getvalue(self):
+        return self._buffer.getvalue()
+
+
+def _blocked_sys_exit(*_args, **_kwargs):
+    raise RuntimeError("sys.exit() is not allowed in execute_code")
+
+
+def _truncate_captured_output(text):
+    encoded = text.encode("utf-8")
+    if len(encoded) <= MAX_EXECUTE_CODE_OUTPUT_BYTES:
+        return text
+    truncated = encoded[:MAX_EXECUTE_CODE_OUTPUT_BYTES].decode("utf-8", errors="ignore")
+    return truncated + f"\n... [truncated, {len(encoded)} bytes total]"
+
+
+# execute_code guardrails: not a real sandbox, just cheap guidance against
+# accidentally wrecking the user's session - "if the LLM (or its user) is
+# motivated, these can be worked around." A determined attacker isn't the
+# threat model here (execute_code already runs arbitrary Python with the
+# user's permissions); this only catches the plain, literal spelling of a
+# handful of destructive calls a wayward LLM might otherwise write.
+#
+# This is a static (AST) check rather than intercepting bpy.ops calls at
+# runtime: Blender's private operator-dispatch internals aren't stable
+# across the version range this add-on supports (verified: patching
+# bpy.ops._op_create_function works on 5.1 but is never even invoked on
+# 4.2 LTS), so runtime interception would silently provide zero protection
+# on part of our supported range.
+_BLOCKED_OPERATORS = {
+    ("wm", "quit_blender"):
+        "terminates the Blender process; use bpy.app.quit() if you must",
+    ("wm", "read_factory_settings"):
+        "resets all user preferences and the startup file",
+    ("wm", "read_factory_userpref"):
+        "resets all user preferences",
+    ("wm", "read_userpref"):
+        "may reset user preferences, which can disable this add-on",
+}
+
+
+def _attribute_chain(node):
+    """Return e.g. ['bpy', 'ops', 'wm', 'quit_blender'] for an AST node
+    shaped like `bpy.ops.wm.quit_blender`, or None otherwise."""
+    parts = []
+    while isinstance(node, ast.Attribute):
+        parts.append(node.attr)
+        node = node.value
+    if isinstance(node, ast.Name):
+        parts.append(node.id)
+        parts.reverse()
+        return parts
+    return None
+
+
+def _check_code_for_blocked_operators(code):
+    try:
+        tree = ast.parse(code)
+    except SyntaxError:
+        return  # exec() raises its own, clearer SyntaxError momentarily.
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        chain = _attribute_chain(node.func)
+        if chain is None or len(chain) != 4 or chain[0] != "bpy" or chain[1] != "ops":
+            continue
+        reason = _BLOCKED_OPERATORS.get((chain[2], chain[3]))
+        if reason is not None:
+            raise RuntimeError(
+                f"execute_code may not call bpy.ops.{chain[2]}.{chain[3]}(): {reason}"
+            )
+
+
 def cmd_execute_code(params):
     _require_mapping(params, "params")
     code = _require_string(
@@ -1046,6 +1139,7 @@ def cmd_execute_code(params):
     )
     if len(code.encode("utf-8")) > MAX_EXECUTE_CODE_BYTES:
         raise ValueError(f"code must be at most {MAX_EXECUTE_CODE_BYTES} UTF-8 bytes")
+    _check_code_for_blocked_operators(code)
     local_ns = {
         "bpy": bpy,
         "bmesh": bmesh,
@@ -1055,13 +1149,27 @@ def cmd_execute_code(params):
         "Quaternion": Quaternion,
         "Vector": Vector,
     }
-    exec(compile(code, "<mcp_execute_code>", "exec"), local_ns, local_ns)
+    stdout_tee = _TeeOutput(sys.stdout)
+    stderr_tee = _TeeOutput(sys.stderr)
+    original_stdout, original_stderr, original_exit = sys.stdout, sys.stderr, sys.exit
+    sys.stdout, sys.stderr, sys.exit = stdout_tee, stderr_tee, _blocked_sys_exit
+    try:
+        exec(compile(code, "<mcp_execute_code>", "exec"), local_ns, local_ns)
+    finally:
+        sys.stdout, sys.stderr, sys.exit = original_stdout, original_stderr, original_exit
     result = local_ns.get("result")
     try:
         json.dumps(result)
     except (TypeError, ValueError):
         result = repr(result)
-    return {"result": result}
+    response = {"result": result}
+    stdout_text = _truncate_captured_output(stdout_tee.getvalue())
+    stderr_text = _truncate_captured_output(stderr_tee.getvalue())
+    if stdout_text:
+        response["stdout"] = stdout_text
+    if stderr_text:
+        response["stderr"] = stderr_text
+    return response
 
 
 def cmd_save_file(params):

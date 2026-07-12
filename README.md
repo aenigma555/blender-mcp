@@ -105,7 +105,7 @@ sun light, and render it."
 | `set_shading` | Smooth- or flat-shade all faces of a mesh |
 | `undo` | Undo the last N Blender undo steps |
 | `redo` | Redo the last N undone steps |
-| `execute_code` | Escape hatch: run arbitrary `bpy`/`bmesh` code (own `timeout` for long scripts) |
+| `execute_code` | Escape hatch: run arbitrary `bpy`/`bmesh` code (own `timeout` for long scripts); captures `print()` output as `stdout`/`stderr`; blocks a few destructive calls and `sys.exit()` as a guardrail |
 | `save_file` | Save the `.blend` file (save-as with `filepath`, in place without) |
 | `get_objects_summary` | Scene's collection hierarchy (nested collections and their objects), unlike `get_scene_info`'s flat list |
 | `get_window_summary` | JSON description of window layout, areas, current mode, active object, and selection |
@@ -251,6 +251,15 @@ declared minimum version.
   interactive session to notice something going wrong — treat any `.blend`
   file path you hand it as fully trusted, the same as you would `execute_code`
   itself.
+- `execute_code`'s guardrails (blocking `bpy.ops.wm.quit_blender` and a few
+  preference/startup-file resets, plus `sys.exit()`) are cheap insurance
+  against an accidental mistake, not a real sandbox — a determined caller can
+  still work around them, same as `execute_code`'s general trust model. The
+  blocked-operator check is a static scan of the code's syntax tree (looking
+  for the literal `bpy.ops.<module>.<func>(...)` shape) rather than
+  intercepting calls at runtime: Blender's private operator-dispatch
+  internals used for that in some other Blender MCP implementations aren't
+  stable across the Blender versions this add-on supports.
 - To protect Blender's interactive session, the add-on bounds command and
   response sizes, queued work, concurrent client handlers, render dimensions,
   and its request-response cache. Requests are rejected when those limits are

@@ -595,9 +595,15 @@ def execute_code(code: str, timeout: float = DEFAULT_TIMEOUT) -> dict:
     """Escape hatch: run arbitrary Python inside Blender. `bpy`, `bmesh`,
     `mathutils`, `Vector`, `Matrix`, `Euler` and `Quaternion` are predefined.
     Assign to a variable named `result` to return data (non-JSON-serializable
-    results come back as their repr). Use for anything not covered by the
-    other tools (modifiers, geometry nodes, UV work, etc.); raise timeout
-    (seconds) for long-running scripts like physics bakes."""
+    results come back as their repr). `print()` output is captured and
+    returned as `stdout`/`stderr` (each capped, with a trailing truncation
+    marker if exceeded) - handy for debugging while iterating on a script.
+    Use for anything not covered by the other tools (modifiers, geometry
+    nodes, UV work, etc.); raise timeout (seconds) for long-running scripts
+    like physics bakes. A few destructive calls (`bpy.ops.wm.quit_blender`
+    and preference/startup-file resets) and `sys.exit()` are blocked as a
+    guardrail against accidental self-inflicted damage - not a real sandbox,
+    just cheap insurance against the obvious mistakes."""
     if not isinstance(code, str):
         raise TypeError("code must be a string")
     if len(code.encode("utf-8")) > MAX_EXECUTE_CODE_BYTES:

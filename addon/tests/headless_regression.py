@@ -1135,6 +1135,65 @@ class BlenderMCPHeadlessTests(unittest.TestCase):
         self.assertEqual(response["status"], "ok")
         self.assertIn("CLICodeObject", response["result"]["result"])
 
+    def test_execute_code_captures_stdout_and_stderr(self) -> None:
+        result = ADDON.cmd_execute_code({
+            "code": (
+                "print('hello stdout')\n"
+                "import sys\n"
+                "print('hello stderr', file=sys.stderr)\n"
+                "result = 1 + 1"
+            ),
+        })
+        self.assertEqual(result["result"], 2)
+        self.assertEqual(result["stdout"], "hello stdout\n")
+        self.assertEqual(result["stderr"], "hello stderr\n")
+
+    def test_execute_code_omits_stdout_stderr_keys_when_no_output(self) -> None:
+        result = ADDON.cmd_execute_code({"code": "result = 42"})
+        self.assertEqual(result, {"result": 42})
+        self.assertNotIn("stdout", result)
+        self.assertNotIn("stderr", result)
+
+    def test_execute_code_truncates_oversized_captured_output(self) -> None:
+        result = ADDON.cmd_execute_code({
+            "code": "print('x' * (ADDON_MAX + 1000))\nresult = None".replace(
+                "ADDON_MAX", str(ADDON.MAX_EXECUTE_CODE_OUTPUT_BYTES)
+            ),
+        })
+        self.assertLess(len(result["stdout"].encode("utf-8")), ADDON.MAX_EXECUTE_CODE_OUTPUT_BYTES + 200)
+        self.assertIn("truncated", result["stdout"])
+
+    def test_execute_code_blocks_sys_exit(self) -> None:
+        with self.assertRaisesRegex(RuntimeError, "sys.exit"):
+            ADDON.cmd_execute_code({"code": "import sys\nsys.exit(1)"})
+        # The guardrail must not leak a patched sys.exit into later code.
+        self.assertIs(sys.exit, ADDON.sys.exit)
+
+    def test_execute_code_blocks_listed_destructive_operators(self) -> None:
+        for module, func in ADDON._BLOCKED_OPERATORS:
+            with self.subTest(op=f"{module}.{func}"):
+                with self.assertRaisesRegex(RuntimeError, f"bpy.ops.{module}.{func}"):
+                    ADDON.cmd_execute_code({"code": f"bpy.ops.{module}.{func}()"})
+
+    def test_execute_code_allows_mentioning_blocked_names_in_strings_or_comments(
+        self,
+    ) -> None:
+        # The guardrail is an AST check for an actual call expression, not a
+        # substring search, so this must not be blocked.
+        result = ADDON.cmd_execute_code({
+            "code": (
+                "# do not call quit_blender here\n"
+                "result = 'quit_blender is just a string here'"
+            ),
+        })
+        self.assertEqual(result["result"], "quit_blender is just a string here")
+
+    def test_execute_code_still_allows_ordinary_bpy_ops_calls(self) -> None:
+        result = ADDON.cmd_execute_code({
+            "code": "bpy.ops.mesh.primitive_cube_add()\nresult = len(bpy.data.objects)",
+        })
+        self.assertGreater(result["result"], 0)
+
     def test_process_queue_uses_configured_poll_intervals(self) -> None:
         ADDON.register()
         settings = bpy.context.scene.blender_mcp_settings
