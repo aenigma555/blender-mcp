@@ -1069,21 +1069,20 @@ class BlenderMCPHeadlessTests(unittest.TestCase):
             ADDON.cmd_get_screenshot_of_area({"area_ui_type": next(iter(missing))})
 
     def test_downscale_image_to_size_limit_shrinks_a_real_png(self) -> None:
-        # A real render (not a screenshot) works fine in --background mode
-        # and is a genuine PNG file for the imbuf-based downscale to work on.
-        bpy.ops.object.camera_add(location=(5, -5, 5), rotation=(1.1, 0, 0.78))
-        bpy.context.scene.camera = bpy.context.active_object
-        render = bpy.context.scene.render
-        original_resolution = (render.resolution_x, render.resolution_y)
-        render.resolution_x = 400
-        render.resolution_y = 400
+        # A procedurally generated image (not a render or screenshot) is a
+        # genuine, varied PNG for the imbuf-based downscale to work on,
+        # without needing a GPU/EGL context CI doesn't have - unlike
+        # bpy.ops.render.render, generating a COLOR_GRID image is pure CPU
+        # work built into Blender core.
         output_path = os.path.join(
             tempfile.gettempdir(), f"mcp_test_downscale_{uuid.uuid4().hex}.png"
         )
-        render.filepath = output_path
-        render.image_settings.file_format = "PNG"
+        image = bpy.data.images.new("DownscaleTestImage", 400, 400, alpha=False)
         try:
-            bpy.ops.render.render(write_still=True)
+            image.generated_type = 'COLOR_GRID'
+            image.filepath_raw = output_path
+            image.file_format = 'PNG'
+            image.save()
             full_size = os.path.getsize(output_path)
 
             # A no-op when the file already fits or the limit is disabled (0).
@@ -1097,7 +1096,7 @@ class BlenderMCPHeadlessTests(unittest.TestCase):
             downscaled_size = os.path.getsize(output_path)
             self.assertLess(downscaled_size, full_size)
         finally:
-            render.resolution_x, render.resolution_y = original_resolution
+            bpy.data.images.remove(image)
             try:
                 os.remove(output_path)
             except OSError:
