@@ -10,6 +10,7 @@ bl_info = {
 
 import ast
 import base64
+from array import array
 from collections import OrderedDict
 import hashlib
 import inspect
@@ -233,6 +234,70 @@ def _world_bounding_box(obj):
     min_corner = Vector(map(min, zip(*corners)))
     max_corner = Vector(map(max, zip(*corners)))
     return [list(min_corner), list(max_corner)]
+
+
+def _collection_meshes(collection_name):
+    """Return the mesh objects owned by a collection, including children."""
+    collection = bpy.data.collections.get(collection_name)
+    if collection is None:
+        raise ValueError(f"No collection named '{collection_name}'")
+    meshes = [obj for obj in collection.all_objects if obj.type == "MESH"]
+    if not meshes:
+        raise ValueError(f"Collection '{collection_name}' contains no mesh objects")
+    return collection, meshes
+
+
+def _mesh_bounds(objects):
+    """Compute a combined world-space AABB for mesh objects."""
+    corners = []
+    for obj in objects:
+        lower, upper = _world_bounding_box(obj)
+        corners.extend((Vector(lower), Vector(upper)))
+    return Vector(map(min, zip(*corners))), Vector(map(max, zip(*corners)))
+
+
+def cmd_analyze_character_proportions(params):
+    """Report coarse, explainable character-blockout measurements.
+
+    This deliberately does not claim anatomical correctness. It gives agents
+    objective signals to review before adding face, hair, or clothing detail.
+    """
+    _require_mapping(params, "params")
+    collection_name = _require_string(params["collection_name"], "collection_name", max_length=256)
+    collection, meshes = _collection_meshes(collection_name)
+    lower, upper = _mesh_bounds(meshes)
+    size = upper - lower
+
+    head = next((obj for obj in meshes if obj.name.casefold() == "head"), None)
+    head_height = None
+    head_count = None
+    if head is not None:
+        head_lower, head_upper = _world_bounding_box(head)
+        head_height = head_upper[2] - head_lower[2]
+        if head_height > 1e-9:
+            head_count = size.z / head_height
+
+    left = {obj.name[:-2] for obj in meshes if obj.name.endswith("_L")}
+    right = {obj.name[:-2] for obj in meshes if obj.name.endswith("_R")}
+    warnings = []
+    if head_count is not None and head_count < 5.0:
+        warnings.append("Silhouette is strongly stylized: fewer than five head-heights tall")
+    if head_count is not None and head_count > 9.0:
+        warnings.append("Silhouette is unusually elongated: more than nine head-heights tall")
+    if lower.z > 0.02:
+        warnings.append("Model does not appear to contact the ground plane")
+    if left != right:
+        warnings.append("Named left/right mesh pairs are incomplete")
+
+    return {
+        "collection": collection.name,
+        "mesh_object_count": len(meshes),
+        "bounds": {"min": list(lower), "max": list(upper), "size": list(size)},
+        "height": size.z,
+        "head": {"object": head.name if head else None, "height": head_height, "head_count": head_count},
+        "named_symmetry": {"paired": sorted(left & right), "left_only": sorted(left - right), "right_only": sorted(right - left)},
+        "warnings": warnings,
+    }
 
 
 def cmd_get_object_info(params):
@@ -1713,6 +1778,131 @@ def cmd_render_thumbnail(params):
     return result
 
 
+def _composite_review_pixels(canvas, pixels, width, height, channels, column):
+    """Copy an RGB or RGBA render buffer into one RGBA contact-sheet column."""
+    expected = width * height * channels
+    if channels not in (3, 4) or len(pixels) != expected:
+        raise ValueError("Expected a tightly packed RGB or RGBA pixel buffer")
+    for row in range(height):
+        for pixel in range(width):
+            src_start = (row * width + pixel) * channels
+            dst_start = (row * width * 3 + column * width + pixel) * 4
+            canvas[dst_start:dst_start + 3] = pixels[src_start:src_start + 3]
+            canvas[dst_start + 3] = pixels[src_start + 3] if channels == 4 else 1.0
+
+
+def cmd_render_turntable_review(params):
+    """Render front, side, and three-quarter Workbench views as one image.
+
+    The temporary camera, render settings, and contact-sheet image are removed
+    afterwards; only the returned PNG artifact remains on disk.
+    """
+    _require_mapping(params, "params")
+    collection_name = _require_string(params["collection_name"], "collection_name", max_length=256)
+    size = _require_int(params.get("size", 256), "size", minimum=64, maximum=MAX_THUMBNAIL_DIMENSION)
+    filepath_param = params.get("filepath")
+    if filepath_param is not None:
+        filepath_param = _require_string(filepath_param, "filepath", max_length=4096)
+    return_image = _require_bool(params.get("return_image", True), "return_image")
+    collection, meshes = _collection_meshes(collection_name)
+    lower, upper = _mesh_bounds(meshes)
+    focus = (lower + upper) / 2.0
+    extent = upper - lower
+    filepath = bpy.path.abspath(filepath_param or _safe_default_image_path("turntable"))
+
+    scene = bpy.context.scene
+    render = scene.render
+    saved = {
+        "camera": scene.camera,
+        "resolution_x": render.resolution_x,
+        "resolution_y": render.resolution_y,
+        "resolution_percentage": render.resolution_percentage,
+        "filepath": render.filepath,
+        "file_format": render.image_settings.file_format,
+        "use_file_extension": render.use_file_extension,
+        "engine": render.engine,
+    }
+    camera_data = bpy.data.cameras.new("MCP_Turntable_Review")
+    camera = bpy.data.objects.new("MCP_Turntable_Review", camera_data)
+    contact = None
+    try:
+        scene.collection.objects.link(camera)
+        camera.data.lens = 50.0
+        # Frame the largest silhouette dimension at roughly 78% of the view.
+        distance = max(extent.x, extent.z) / max(2.0 * math.tan(camera.data.angle_y / 2.0) * 0.78, 1e-6)
+        distance = max(distance, max(extent) * 1.2, 0.1)
+        scene.camera = camera
+        render.resolution_x = size
+        render.resolution_y = size
+        render.resolution_percentage = 100
+        render.image_settings.file_format = "PNG"
+        render.use_file_extension = False
+        try:
+            render.engine = "BLENDER_WORKBENCH"
+        except TypeError:
+            pass
+
+        canvas = None
+        source_size = None
+        offsets = ((0.0, -distance, 0.0), (distance, 0.0, 0.0), (distance * 0.72, -distance * 0.72, 0.0))
+        for column, offset in enumerate(offsets):
+            camera.location = focus + Vector(offset)
+            direction = focus - camera.location
+            camera.matrix_world = Matrix.LocRotScale(
+                camera.location, direction.to_track_quat("-Z", "Y"), Vector((1.0, 1.0, 1.0))
+            )
+            render_result = bpy.ops.render.render(write_still=False)
+            if "FINISHED" not in render_result:
+                raise RuntimeError(f"Turntable render did not complete (result: {render_result!r})")
+            render_image = bpy.data.images.get("Render Result")
+            if render_image is None:
+                raise RuntimeError("Turntable render produced no Render Result image")
+            width, height = render_image.size
+            if width <= 0 or height <= 0:
+                raise RuntimeError("Turntable render produced an empty image; use an interactive Blender session with a working render context")
+            pixels = array("f", render_image.pixels[:])
+            pixel_count = width * height
+            channels = len(pixels) // pixel_count if pixel_count else 0
+            if channels not in (3, 4) or len(pixels) != pixel_count * channels:
+                raise RuntimeError("Turntable render returned an unsupported pixel buffer")
+            if source_size is None:
+                source_size = (width, height)
+                canvas = array("f", [0.0]) * (width * 3 * height * 4)
+            elif source_size != (width, height):
+                raise RuntimeError("Turntable views returned inconsistent image sizes")
+
+            _composite_review_pixels(canvas, pixels, width, height, channels, column)
+
+        contact = bpy.data.images.new(
+            "MCP_Turntable_Contact_Sheet", width=source_size[0] * 3, height=source_size[1], alpha=True, float_buffer=True
+        )
+        contact.pixels.foreach_set(canvas)
+        contact.update()
+        contact.filepath_raw = filepath
+        contact.file_format = "PNG"
+        contact.save()
+    finally:
+        scene.camera = saved["camera"]
+        render.resolution_x = saved["resolution_x"]
+        render.resolution_y = saved["resolution_y"]
+        render.resolution_percentage = saved["resolution_percentage"]
+        render.filepath = saved["filepath"]
+        render.image_settings.file_format = saved["file_format"]
+        render.use_file_extension = saved["use_file_extension"]
+        render.engine = saved["engine"]
+        if contact is not None and contact.name in bpy.data.images:
+            bpy.data.images.remove(contact)
+        if camera.name in bpy.data.objects:
+            bpy.data.objects.remove(camera, do_unlink=True)
+        if camera_data.name in bpy.data.cameras:
+            bpy.data.cameras.remove(camera_data)
+
+    result = {"filepath": filepath, "views": ["front", "side", "three_quarter"], "collection": collection.name}
+    if return_image:
+        result["image_base64"] = _image_file_to_base64(filepath)
+    return result
+
+
 def cmd_get_blendfile_summary_datablocks(params):
     _require_mapping(params, "params")
     counts = {}
@@ -1938,6 +2128,7 @@ _MUTATING_COMMANDS = {
 _HANDLERS = {
     "get_scene_info": cmd_get_scene_info,
     "get_object_info": cmd_get_object_info,
+    "analyze_character_proportions": cmd_analyze_character_proportions,
     "add_primitive": cmd_add_primitive,
     "delete_object": cmd_delete_object,
     "set_transform": cmd_set_transform,
@@ -1963,6 +2154,7 @@ _HANDLERS = {
     "get_window_summary": cmd_get_window_summary,
     "jump_to_view3d_object": cmd_jump_to_view3d_object,
     "render_thumbnail": cmd_render_thumbnail,
+    "render_turntable_review": cmd_render_turntable_review,
     "get_blendfile_summary_datablocks": cmd_get_blendfile_summary_datablocks,
     "get_blendfile_summary_missing_files": cmd_get_blendfile_summary_missing_files,
     "get_blendfile_summary_linked_libraries": cmd_get_blendfile_summary_linked_libraries,

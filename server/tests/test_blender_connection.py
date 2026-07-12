@@ -439,6 +439,24 @@ class BlenderConnectionProtocolTests(unittest.TestCase):
         self.assertTrue(closed_socket.closed)
         self.assertIs(connection.sock, fresh_socket)
 
+    def test_character_proportion_audit_is_retry_safe(self):
+        self.assertIn("analyze_character_proportions", server.RETRY_SAFE_COMMANDS)
+        closed_socket = ScriptedSocket(lambda _request: [b""])
+        fresh_socket = ScriptedSocket(
+            lambda request: [response_bytes(request, result={"height": 1.8})]
+        )
+        connection = server.BlenderConnection("127.0.0.1", 19876)
+        connection.sock = closed_socket
+
+        with mock.patch.object(server.socket, "socket", return_value=fresh_socket):
+            result = connection.send_command(
+                "analyze_character_proportions", {"collection_name": "Character"}
+            )
+
+        self.assertEqual(result, {"height": 1.8})
+        self.assertTrue(closed_socket.closed)
+        self.assertIs(connection.sock, fresh_socket)
+
     def test_new_render_command_is_not_retry_safe(self):
         # render_thumbnail writes a file as a side effect, like render_scene;
         # it must never be silently replayed after losing its connection.
@@ -458,10 +476,27 @@ class BlenderConnectionProtocolTests(unittest.TestCase):
         self.assertIn("unknown", message)
         socket_factory.assert_not_called()
 
+    def test_turntable_review_is_not_retry_safe(self):
+        self.assertNotIn("render_turntable_review", server.RETRY_SAFE_COMMANDS)
+        closed_socket = ScriptedSocket(lambda _request: [b""])
+        connection = server.BlenderConnection("127.0.0.1", 19876)
+        connection.sock = closed_socket
+
+        with (
+            mock.patch.object(server.socket, "socket") as socket_factory,
+            self.assertRaises(ConnectionError),
+        ):
+            connection.send_command(
+                "render_turntable_review", {"collection_name": "Character", "size": 128}
+            )
+        socket_factory.assert_not_called()
+
     def test_server_exposes_field_guide_instructions(self):
         self.assertEqual(server.mcp.instructions, server.SERVER_INSTRUCTIONS)
         self.assertIn("rotation_mode", server.SERVER_INSTRUCTIONS)
         self.assertIn("_for_cli", server.SERVER_INSTRUCTIONS)
+        self.assertIn("Asset-creation quality workflow", server.SERVER_INSTRUCTIONS)
+        self.assertIn("Blockout", server.SERVER_INSTRUCTIONS)
 
 
 if __name__ == "__main__":

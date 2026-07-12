@@ -39,6 +39,7 @@ MAX_EXECUTE_CODE_BYTES = 8 * 1024 * 1024
 MAX_CLI_STDERR_CHARS = 4000
 RETRY_SAFE_COMMANDS = frozenset({
     "get_scene_info", "get_object_info", "get_objects_summary", "get_window_summary",
+    "analyze_character_proportions",
     "get_blendfile_summary_datablocks", "get_blendfile_summary_missing_files",
     "get_blendfile_summary_linked_libraries", "get_blendfile_summary_path_info",
     "get_blendfile_summary_usage_guess", "get_python_api_docs",
@@ -48,6 +49,37 @@ SERVER_INSTRUCTIONS = """\
 This connects to a live, running Blender instance. Prefer the specific
 tools below over execute_code where one exists - they already handle
 Blender's sharp edges (rotation modes, undo boundaries, etc.) for you.
+
+## Asset-creation quality workflow
+
+Use this sequence for any request to create or materially improve a 3D asset.
+Do not skip straight to a dense collection of details.
+
+1. **Live-session gate.** Before changing an interactive scene, call
+   `get_scene_info`. For visual work, also capture a `get_viewport_screenshot`
+   baseline. If the live bridge is unavailable, report that and fix the
+   connection; do not substitute a `*_for_cli` background process for an
+   interactive-session request.
+2. **Brief.** Establish the intended style, target use (render, game,
+   animation, print), scale, pose, and reference image when they materially
+   affect the result. When details are absent, state a modest default rather
+   than silently committing to a specific art direction.
+3. **Blockout.** First create a small, editable silhouette in an owned,
+   clearly named collection. Preserve unrelated scene content. For characters,
+   assess head/body ratio, stance, shoulder width, limb length, and silhouette
+   before adding eyes, hair, clothing accents, fingers, or other micro-detail.
+4. **Review.** Capture front, side, and three-quarter material-preview or
+   render views after the blockout. Compare them against the brief and identify
+   the highest-impact visible issue.
+5. **Targeted refinement.** Change one category at a time: silhouette and
+   proportions, anatomy/forms, clothing, face/hair, then materials/lighting.
+   A request such as "make it better" means inspect first and name the visual
+   issue being addressed; it does not mean keep adding disconnected geometry.
+   Modify owned forms where practical rather than accumulating floating parts.
+6. **Validate and hand off.** Recheck the same views, inspect the resulting
+   scene structure, and verify the requested target: for example, plausible
+   topology and non-intersection for a mesh, or a saved output for a render.
+   Do not save or overwrite a user's .blend file unless they ask.
 
 ## Common execute_code gotchas
 
@@ -365,6 +397,18 @@ def get_object_info(name: str) -> dict:
     bounding box, which accounts for rotation unlike the local-space `dimensions`
     field."""
     return _conn.send_command("get_object_info", {"name": name})
+
+
+@mcp.tool()
+def analyze_character_proportions(collection_name: str) -> dict:
+    """Measure a character collection's silhouette, head-height ratio,
+    ground contact, and named left/right symmetry. Use it after a blockout
+    before spending time on facial or clothing detail."""
+    if not isinstance(collection_name, str) or not collection_name.strip():
+        raise ValueError("collection_name must be a non-empty string")
+    return _conn.send_command(
+        "analyze_character_proportions", {"collection_name": collection_name}
+    )
 
 
 PrimitiveType = Literal["cube", "sphere", "ico_sphere", "cylinder", "cone", "plane", "torus", "monkey"]
@@ -825,6 +869,28 @@ def render_thumbnail(
             raise ValueError("filepath must be a non-empty string when provided")
         params["filepath"] = filepath
     result = _conn.send_command("render_thumbnail", params, timeout=timeout)
+    return _decode_png_result(result)
+
+
+@mcp.tool()
+def render_turntable_review(
+    collection_name: str,
+    size: int = 256,
+    filepath: Optional[str] = None,
+    timeout: float = 120,
+) -> Image:
+    """Return a temporary front/side/three-quarter Workbench contact sheet
+    for the collection. The scene's camera and render settings are restored."""
+    if not isinstance(collection_name, str) or not collection_name.strip():
+        raise ValueError("collection_name must be a non-empty string")
+    size = _bounded_int(size, "size", minimum=64, maximum=MAX_THUMBNAIL_DIMENSION)
+    timeout = _finite_number(timeout, "timeout", minimum=1.0e-6, maximum=MAX_TIMEOUT)
+    params: dict[str, Any] = {"collection_name": collection_name, "size": size, "return_image": True}
+    if filepath is not None:
+        if not isinstance(filepath, str) or not filepath.strip():
+            raise ValueError("filepath must be a non-empty string when provided")
+        params["filepath"] = filepath
+    result = _conn.send_command("render_turntable_review", params, timeout=timeout)
     return _decode_png_result(result)
 
 

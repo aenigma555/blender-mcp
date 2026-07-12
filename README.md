@@ -116,6 +116,7 @@ same Blender tools described below.
 |---|---|
 | `get_scene_info` | List objects and their transforms (capped by `limit`, default 200, with `object_count`/`truncated` for big scenes) |
 | `get_object_info` | Mesh stats, modifiers, materials, constraints, children, data-block name, collections, and (for meshes) world-space bounding box for one object |
+| `analyze_character_proportions` | Measure a character collection's silhouette, head-height ratio, ground contact, and named left/right symmetry before refinement |
 | `add_primitive` | Add cube/sphere/ico-sphere/cylinder/cone/plane/torus/monkey |
 | `delete_object` | Remove an object |
 | `set_transform` | Move/rotate/scale an object (rotation works in any rotation mode) |
@@ -141,6 +142,7 @@ same Blender tools described below.
 | `get_window_summary` | JSON description of window layout, areas, current mode, active object, and selection |
 | `jump_to_view3d_object` | Select an object, make it active, and frame it in the 3D viewport; `allow_edits` un-hides it and enables its collection first if needed |
 | `render_thumbnail` | Fast, low-quality preview render (Workbench engine, no sample convergence); use `render_scene` for full quality |
+| `render_turntable_review` | Temporary front/side/three-quarter Workbench contact sheet for a collection; restores the scene camera and render settings |
 | `get_blendfile_summary_datablocks` | Data-block counts by type, active workspace, current render engine |
 | `get_blendfile_summary_missing_files` | External file references (images/libraries/fonts/sounds/movie clips/cache files) missing on disk |
 | `get_blendfile_summary_linked_libraries` | Tree of directly and indirectly linked library (`.blend`) files |

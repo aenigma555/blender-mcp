@@ -1292,6 +1292,55 @@ class BlenderMCPHeadlessTests(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             ADDON.cmd_render_thumbnail({"size": 16})
 
+    def test_character_proportion_audit_reports_measurements_and_warnings(self) -> None:
+        collection = bpy.data.collections.new("Character")
+        bpy.context.scene.collection.children.link(collection)
+
+        bpy.ops.mesh.primitive_cube_add(location=(0, 0, 1.0))
+        torso = bpy.context.object
+        torso.name = "Torso"
+        torso.scale = (0.4, 0.2, 1.0)
+        bpy.context.view_layer.update()
+        for source in list(torso.users_collection):
+            source.objects.unlink(torso)
+        collection.objects.link(torso)
+
+        bpy.ops.mesh.primitive_cube_add(location=(0, 0, 2.3))
+        head = bpy.context.object
+        head.name = "Head"
+        head.scale = (0.25, 0.25, 0.25)
+        bpy.context.view_layer.update()
+        for source in list(head.users_collection):
+            source.objects.unlink(head)
+        collection.objects.link(head)
+
+        report = ADDON.cmd_analyze_character_proportions({"collection_name": "Character"})
+        self.assertEqual(report["collection"], "Character")
+        self.assertEqual(report["mesh_object_count"], 2)
+        self.assertEqual(report["head"]["object"], "Head")
+        self.assertGreater(report["head"]["head_count"], 5.0)
+        self.assertAlmostEqual(report["bounds"]["min"][2], 0.0, places=5)
+
+    def test_turntable_review_validates_before_rendering(self) -> None:
+        with self.assertRaises(ValueError):
+            ADDON.cmd_render_turntable_review({"collection_name": "Missing", "size": 16})
+
+    def test_turntable_contact_sheet_normalizes_rgb_and_rgba_buffers(self) -> None:
+        canvas = ADDON.array("f", [0.0]) * 24  # 3 columns x 2 pixels x RGBA
+        ADDON._composite_review_pixels(
+            canvas, ADDON.array("f", [0.1, 0.2, 0.3, 0.4, 0.5, 0.6]), 2, 1, 3, 1
+        )
+        self.assertEqual(
+            [round(value, 6) for value in canvas[8:16]], [0.1, 0.2, 0.3, 1.0, 0.4, 0.5, 0.6, 1.0]
+        )
+
+        ADDON._composite_review_pixels(
+            canvas, ADDON.array("f", [0.7, 0.8, 0.9, 0.25, 0.3, 0.2, 0.1, 0.75]), 2, 1, 4, 2
+        )
+        self.assertEqual(
+            [round(value, 6) for value in canvas[16:24]], [0.7, 0.8, 0.9, 0.25, 0.3, 0.2, 0.1, 0.75]
+        )
+
     def test_get_blendfile_summary_datablocks_counts_present_types(self) -> None:
         bpy.data.objects.new("CountedObject", None)
         summary = ADDON.cmd_get_blendfile_summary_datablocks({})
